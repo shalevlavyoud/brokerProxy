@@ -28,6 +28,13 @@ public record AppConfig(
         String redisPrefix,
         int redisConnectTimeoutMs,
         int commitTimeoutMs,
+        /**
+         * The epoch this instance believes it is the leader for.
+         * The Lua commit script checks this against {@code bp:leader:epoch} stored
+         * in Redis; a mismatch returns {@code FENCED} and writes nothing.
+         * Default 1 — for local development, seed Redis with {@code SET bp:leader:epoch 1}.
+         */
+        long leaderEpoch,
 
         // ---- Topics ----
         List<String> topics,
@@ -66,6 +73,7 @@ public record AppConfig(
     public static final String  DEFAULT_REDIS_PREFIX            = "bp";
     public static final int     DEFAULT_REDIS_CONNECT_TIMEOUT   = 5_000;
     public static final int     DEFAULT_COMMIT_TIMEOUT          = 5_000;
+    public static final long    DEFAULT_LEADER_EPOCH            = 1L;
 
     public static final List<String> DEFAULT_TOPICS =
             List.of("computers", "headsets", "conferences");
@@ -111,6 +119,7 @@ public record AppConfig(
                 redis.getString("prefix",          DEFAULT_REDIS_PREFIX),
                 redis.getInteger("connectTimeout", DEFAULT_REDIS_CONNECT_TIMEOUT),
                 redis.getInteger("commitTimeout",  DEFAULT_COMMIT_TIMEOUT),
+                redis.getLong   ("leaderEpoch",    DEFAULT_LEADER_EPOCH),
                 topics,
                 retention.getInteger("windowSize",        DEFAULT_RETENTION_WINDOW),
                 amq.getString("brokerUrl",                DEFAULT_ACTIVEMQ_URL),
