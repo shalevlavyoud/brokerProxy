@@ -7,6 +7,7 @@ import com.brokerproxy.model.Snapshot;
 import com.brokerproxy.model.WritePlan;
 import com.brokerproxy.redis.RedisProvider;
 import com.brokerproxy.service.ComputersDiffEngine;
+import com.brokerproxy.service.ProducerCacheDiffEngine;
 import com.brokerproxy.service.RecencyGate;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
@@ -21,18 +22,17 @@ import org.slf4j.LoggerFactory;
  * Event-loop verticle that receives parsed {@link Snapshot} objects from the
  * event bus and drives the processing pipeline.
  *
- * <h3>Current pipeline (BE-04)</h3>
+ * <h3>Current pipeline (BE-05)</h3>
  * <ol>
  *   <li>Receive snapshot JSON from {@code bp.snapshot.{topic}}</li>
  *   <li>Recency gate — drop if {@code msgTs <= lastAccepted} stored in Redis</li>
- *   <li>Diff engine — compute {@link WritePlan} (computers only; other topics NOOP for now)</li>
+ *   <li>Diff engine — compute {@link WritePlan} for all three topics</li>
  *   <li>Log plan size + metrics</li>
  *   <li>Reply to release the {@link JmsConsumerVerticle} backpressure semaphore</li>
  * </ol>
  *
  * <h3>Future pipeline extensions</h3>
  * <ul>
- *   <li>BE-05 — headsets / conferences diff engine (replaces NOOP)</li>
  *   <li>BE-06 — atomic Lua commit (recency write moved there, updateRecency() removed)</li>
  * </ul>
  */
@@ -42,8 +42,9 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
 
     // ---- Instance state (safe: one instance per deployment) ----------------------
 
-    private RecencyGate        recencyGate;
-    private ComputersDiffEngine computersDiffEngine;
+    private RecencyGate         recencyGate;
+    private ComputersDiffEngine  computersDiffEngine;
+    private ProducerCacheDiffEngine multiItemDiffEngine;  // headsets + conferences
 
     // ---- Lifecycle ---------------------------------------------------------------
 
@@ -54,6 +55,7 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
 
         recencyGate         = new RecencyGate(redisApi, config.redisPrefix());
         computersDiffEngine = new ComputersDiffEngine(redisApi, config.redisPrefix());
+        multiItemDiffEngine = new ProducerCacheDiffEngine(redisApi, config.redisPrefix());
 
         for (String topicName : config.topics()) {
             vertx.eventBus().<JsonObject>consumer(
@@ -125,15 +127,20 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
 
     /**
      * Dispatches to the correct diff engine for the snapshot's topic.
-     * Topics not yet wired (headsets, conferences) return a NOOP plan until BE-05.
+     * <ul>
+     *   <li>{@code computers} — {@link ComputersDiffEngine} (single-item producer)</li>
+     *   <li>{@code headsets}, {@code conferences} — {@link ProducerCacheDiffEngine}
+     *       (multi-item producer)</li>
+     * </ul>
      */
     private Future<WritePlan> runDiff(Snapshot snapshot) {
-        if ("computers".equals(snapshot.topic())) {
-            return computersDiffEngine.diff(snapshot);
-        }
-        // BE-05: headsets + conferences diff engines will be registered here
-        return Future.succeededFuture(
-                WritePlan.noop(snapshot.topic(), snapshot.producerId(), snapshot.msgTs()));
+        return switch (snapshot.topic()) {
+            case "computers"    -> computersDiffEngine.diff(snapshot);
+            case "headsets",
+                 "conferences"  -> multiItemDiffEngine.diff(snapshot);
+            default             -> Future.succeededFuture(
+                    WritePlan.noop(snapshot.topic(), snapshot.producerId(), snapshot.msgTs()));
+        };
     }
 
     /**
