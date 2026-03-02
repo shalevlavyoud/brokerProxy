@@ -82,7 +82,11 @@ public class MainVerticle extends AbstractVerticle {
     private Future<Void> deploySubVerticles(JsonObject config) {
         DeploymentOptions opts = new DeploymentOptions().setConfig(config);
 
-        return vertx.deployVerticle(new HttpServerVerticle(), opts)
+        // SnapshotProcessorVerticle must be registered on the event bus BEFORE
+        // JmsConsumerVerticle starts delivering messages — deploy it first.
+        return vertx.deployVerticle(new SnapshotProcessorVerticle(), opts)
+                .compose(id -> vertx.deployVerticle(new JmsConsumerVerticle(), opts))
+                .compose(id -> vertx.deployVerticle(new HttpServerVerticle(), opts))
                 .mapEmpty();
     }
 }

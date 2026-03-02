@@ -38,6 +38,18 @@ public record AppConfig(
         // ---- ActiveMQ ----
         String activemqBrokerUrl,
 
+        // ---- JMS backpressure ----
+        /** ActiveMQ prefetch window per topic consumer (broker-side flow control). */
+        int jmsTopicPrefetch,
+        /**
+         * Max in-flight snapshots per topic before the JMS listener starts dropping.
+         * A snapshot counts as in-flight from the moment it is parsed until the
+         * SnapshotProcessorVerticle replies via the event bus.
+         */
+        int jmsMaxPendingPerTopic,
+        /** Event-bus request timeout waiting for the processor to reply (ms). */
+        int jmsProcessingTimeoutMs,
+
         // ---- Guardrails ----
         int maxDataJsonBytes,
         int maxChangesPerCommit
@@ -60,6 +72,11 @@ public record AppConfig(
 
     public static final int     DEFAULT_RETENTION_WINDOW        = 10_000;
     public static final String  DEFAULT_ACTIVEMQ_URL            = "tcp://localhost:61616";
+
+    public static final int     DEFAULT_JMS_TOPIC_PREFETCH      = 10;
+    public static final int     DEFAULT_JMS_MAX_PENDING         = 100;
+    public static final int     DEFAULT_JMS_PROCESSING_TIMEOUT  = 5_000;
+
     public static final int     DEFAULT_MAX_DATA_JSON_BYTES     = 65_536;   // 64 KiB
     public static final int     DEFAULT_MAX_CHANGES_PER_COMMIT  = 1_000;
 
@@ -75,6 +92,7 @@ public record AppConfig(
         JsonObject http      = json.getJsonObject("http",       new JsonObject());
         JsonObject redis     = json.getJsonObject("redis",      new JsonObject());
         JsonObject amq       = json.getJsonObject("activemq",   new JsonObject());
+        JsonObject jms       = json.getJsonObject("jms",        new JsonObject());
         JsonObject retention = json.getJsonObject("retention",  new JsonObject());
         JsonObject guard     = json.getJsonObject("guardrails", new JsonObject());
 
@@ -94,10 +112,13 @@ public record AppConfig(
                 redis.getInteger("connectTimeout", DEFAULT_REDIS_CONNECT_TIMEOUT),
                 redis.getInteger("commitTimeout",  DEFAULT_COMMIT_TIMEOUT),
                 topics,
-                retention.getInteger("windowSize", DEFAULT_RETENTION_WINDOW),
-                amq.getString("brokerUrl",         DEFAULT_ACTIVEMQ_URL),
-                guard.getInteger("maxDataJsonBytes",    DEFAULT_MAX_DATA_JSON_BYTES),
-                guard.getInteger("maxChangesPerCommit", DEFAULT_MAX_CHANGES_PER_COMMIT)
+                retention.getInteger("windowSize",        DEFAULT_RETENTION_WINDOW),
+                amq.getString("brokerUrl",                DEFAULT_ACTIVEMQ_URL),
+                jms.getInteger("topicPrefetch",           DEFAULT_JMS_TOPIC_PREFETCH),
+                jms.getInteger("maxPendingPerTopic",      DEFAULT_JMS_MAX_PENDING),
+                jms.getInteger("processingTimeoutMs",     DEFAULT_JMS_PROCESSING_TIMEOUT),
+                guard.getInteger("maxDataJsonBytes",      DEFAULT_MAX_DATA_JSON_BYTES),
+                guard.getInteger("maxChangesPerCommit",   DEFAULT_MAX_CHANGES_PER_COMMIT)
         );
     }
 }

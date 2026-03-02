@@ -14,6 +14,11 @@
   "activemq": {
     "brokerUrl": "tcp://localhost:61616"
   },
+  "jms": {
+    "topicPrefetch": 10,
+    "maxPendingPerTopic": 100,
+    "processingTimeoutMs": 5000
+  },
   "retention": {
     "windowSize": 10000
   },

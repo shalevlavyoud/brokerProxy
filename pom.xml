@@ -103,6 +103,20 @@
       <version>${logstash-encoder.version}</version>
     </dependency>
 
+    <!-- Micrometer core (Counter/Timer builders used in BrokerMetrics) -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+      <version>${micrometer.version}</version>
+    </dependency>
+
+    <!-- ActiveMQ Classic JMS client (non-durable topic consumers) -->
+    <dependency>
+      <groupId>org.apache.activemq</groupId>
+      <artifactId>activemq-client</artifactId>
+      <version>5.18.4</version>
+    </dependency>
+
     <!-- - Test - -->
     <dependency>
       <groupId>io.vertx</groupId>
