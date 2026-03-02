@@ -21,18 +21,23 @@ import java.util.List;
  *       {@code bp:leader:epoch}; returns {@code FENCED} if they differ.</li>
  *   <li><b>Recency check</b> — verifies {@code msgTs > bp:recency:{topic}:{producerId}};
  *       returns {@code DROPPED_RECENCY} if not.</li>
- *   <li><b>SEQ allocation</b> — {@code INCRBY bp:seq:{topic} nChanges};
- *       assigns {@code seq = base - nChanges + i} to each change.</li>
- *   <li><b>Upserts</b> — per item:
- *       {@code HSET state:v}, {@code HSET state:j},
- *       {@code ZADD ch:up seq itemId}, {@code HSET prodver}.</li>
- *   <li><b>Deletes</b> — per itemId:
- *       {@code HDEL state:v}, {@code HDEL state:j},
- *       {@code ZADD ch:del seq itemId}, {@code HDEL prodver}.</li>
+ *   <li><b>SEQ allocation</b> — {@code INCRBY bp:seq:{topic} nChanges}.</li>
+ *   <li><b>Upserts/Deletes</b> — state, change-indices, prodver cache.</li>
  *   <li><b>Recency update</b> — {@code SET recency msgTs}.</li>
  * </ol>
  *
- * <h3>Keys touched (8 KEYS — must all be on the same Redis node)</h3>
+ * <h3>EVALSHA lifecycle (BE-07)</h3>
+ * <ol>
+ *   <li>Call {@link #loadScript()} once at verticle startup — runs
+ *       {@code SCRIPT LOAD} and caches the SHA1.</li>
+ *   <li>Every {@link #eval} call uses {@code EVALSHA sha …} (fast path).</li>
+ *   <li>If Redis returns {@code NOSCRIPT} (script evicted), the SHA is reloaded
+ *       automatically and the {@code EVALSHA} is retried once.</li>
+ *   <li>If {@link #loadScript()} has not yet been called, {@code EVAL} is used
+ *       as a fallback (start-up race guard).</li>
+ * </ol>
+ *
+ * <h3>Keys touched (8 KEYS)</h3>
  * <pre>
  *   KEYS[1]  bp:leader:epoch
  *   KEYS[2]  bp:recency:{topic}:{producerId}
@@ -53,15 +58,6 @@ import java.util.List;
  *   ARGV[4+nUpserts*3]               nDeletes
  *   ARGV[4+nUpserts*3+1 ..]          deletes: itemId × nDeletes
  * </pre>
- *
- * <h3>Returns</h3>
- * <pre>
- *   {status, firstSeq, lastSeq, appliedUpserts, appliedDeletes}
- *   status = "OK" | "FENCED" | "DROPPED_RECENCY"
- * </pre>
- *
- * <h3>TODO BE-07</h3>
- * Replace {@code EVAL} with {@code EVALSHA} (load on startup, reload on NOSCRIPT).
  */
 public class LuaCommitScript {
 
@@ -70,10 +66,11 @@ public class LuaCommitScript {
     // ---- Lua script text --------------------------------------------------------
 
     /**
-     * Lua script executed as a single atomic unit via {@code EVAL}.
+     * The Lua commit script.  Kept as a constant so callers can run
+     * {@code SCRIPT LOAD} and receive a SHA to use with {@code EVALSHA}.
      *
-     * <p>Invariant enforced: no partial state can be observed — if any of the
-     * fencing or recency guards fire, nothing is written to Redis.
+     * <p>Invariant: no partial state can be observed — all guards (fencing,
+     * recency) abort with zero writes if triggered.
      */
     static final String SCRIPT = """
             -- bp-commit-v1: fencing + recency + seq + state + indices (atomic)
@@ -129,6 +126,14 @@ public class LuaCommitScript {
     private final RedisAPI redis;
     private final String   prefix;
 
+    /**
+     * Cached SHA1 from {@code SCRIPT LOAD}.  {@code null} until {@link #loadScript}
+     * completes.  Written once (or on NOSCRIPT reload); read on every eval call.
+     * Declared {@code volatile} so the write is visible across event-loop threads
+     * on multi-core deployments.
+     */
+    private volatile String sha = null;
+
     public LuaCommitScript(RedisAPI redis, String prefix) {
         this.redis  = redis;
         this.prefix = prefix;
@@ -137,86 +142,130 @@ public class LuaCommitScript {
     // ---- Public API -------------------------------------------------------------
 
     /**
+     * Pre-loads the script into the Redis script cache via {@code SCRIPT LOAD}.
+     *
+     * <p>Must be called once at verticle startup.  Subsequent commits will use
+     * the cached SHA via {@code EVALSHA} (faster than {@code EVAL} — skips
+     * script parsing on every call).
+     *
+     * @return a {@link Future} that completes when the SHA has been cached
+     */
+    public Future<Void> loadScript() {
+        return redis.script(List.of("LOAD", SCRIPT))
+                .map(response -> {
+                    sha = response.toString();
+                    log.info("event=commit_script.loaded sha={}", sha);
+                    return (Void) null;
+                })
+                .onFailure(err -> log.error(
+                        "event=commit_script.load_failed error=\"{}\"", err.getMessage()));
+    }
+
+    /**
      * Executes the commit script for the given {@link WritePlan}.
      *
-     * <p>Uses {@code EVAL} directly (BE-07 will upgrade to {@code EVALSHA}).
-     * All I/O is non-blocking; the returned {@link Future} resolves on the
-     * Vert.x event loop.
+     * <p>Uses {@code EVALSHA} when the SHA is cached; falls back to {@code EVAL}
+     * otherwise.  On a {@code NOSCRIPT} error (script evicted from Redis cache),
+     * reloads the SHA and retries {@code EVALSHA} once automatically.
      *
      * @param plan          the diff result to commit
      * @param leaderEpoch   the epoch this instance believes it holds
-     * @return {@link CommitResult} — never fails with a Redis error;
-     *         Redis I/O errors propagate as a failed {@link Future}
      */
     public Future<CommitResult> eval(WritePlan plan, long leaderEpoch) {
-        List<String> args = buildEvalArgs(plan, leaderEpoch);
+        List<String> common = buildCommonArgs(plan, leaderEpoch);
+        String currentSha   = this.sha;
 
-        return redis.eval(args)
+        if (currentSha != null) {
+            return evalSha(currentSha, common)
+                    .recover(err -> handleNoscript(err, common))
+                    .map(this::parseResponse);
+        }
+
+        // SHA not yet loaded — use EVAL as fallback
+        log.debug("event=commit_script.eval_fallback topic={} producerId={}",
+                plan.topic(), plan.producerId());
+        List<String> evalArgs = new ArrayList<>();
+        evalArgs.add(SCRIPT);
+        evalArgs.addAll(common);
+        return redis.eval(evalArgs)
                 .map(this::parseResponse)
                 .onFailure(err -> log.error(
-                        "event=commit.eval_error topic={} producerId={} msgTs={} error=\"{}\"",
-                        plan.topic(), plan.producerId(), plan.msgTs(), err.getMessage()));
+                        "event=commit.eval_error topic={} producerId={} error=\"{}\"",
+                        plan.topic(), plan.producerId(), err.getMessage()));
     }
 
     // ---- Helpers ----------------------------------------------------------------
 
     /**
-     * Builds the full argument list for {@code EVAL script numkeys [key ...] [arg ...]}.
+     * Executes {@code EVALSHA sha numkeys keys... argv...}.
      */
-    private List<String> buildEvalArgs(WritePlan plan, long leaderEpoch) {
+    private Future<Response> evalSha(String scriptSha, List<String> common) {
+        List<String> args = new ArrayList<>();
+        args.add(scriptSha);
+        args.addAll(common);
+        return redis.evalsha(args);
+    }
+
+    /**
+     * Handles a {@code NOSCRIPT} error by reloading the script and retrying
+     * {@code EVALSHA} once.  All other errors are propagated as-is.
+     */
+    private Future<Response> handleNoscript(Throwable err, List<String> common) {
+        if (err.getMessage() != null && err.getMessage().contains("NOSCRIPT")) {
+            log.warn("event=commit_script.noscript_reload");
+            return loadScript()
+                    .compose(v -> evalSha(this.sha, common));
+        }
+        return Future.failedFuture(err);
+    }
+
+    /**
+     * Builds the common argument segment shared by {@code EVAL} and {@code EVALSHA}:
+     * {@code [numkeys, key1..key8, argv1..argN]}.
+     *
+     * <p>The script text or SHA is prepended by the caller.
+     */
+    private List<String> buildCommonArgs(WritePlan plan, long leaderEpoch) {
         String topic      = plan.topic();
         String producerId = plan.producerId();
 
-        // KEYS
-        String epochKey   = prefix + ":leader:epoch";
-        String recencyKey = prefix + ":recency:"  + topic + ":" + producerId;
-        String seqKey     = prefix + ":seq:"       + topic;
-        String stateVKey  = prefix + ":state:v:"   + topic;
-        String stateJKey  = prefix + ":state:j:"   + topic;
-        String chUpKey    = prefix + ":ch:up:"      + topic;
-        String chDelKey   = prefix + ":ch:del:"     + topic;
-        String prodVerKey = prefix + ":prodver:"    + topic + ":" + producerId;
-
         List<String> args = new ArrayList<>();
-        args.add(SCRIPT);   // script text
-        args.add("8");      // numkeys
-        args.add(epochKey);
-        args.add(recencyKey);
-        args.add(seqKey);
-        args.add(stateVKey);
-        args.add(stateJKey);
-        args.add(chUpKey);
-        args.add(chDelKey);
-        args.add(prodVerKey);
+        args.add("8");   // numkeys
+        args.add(prefix + ":leader:epoch");
+        args.add(prefix + ":recency:"  + topic + ":" + producerId);
+        args.add(prefix + ":seq:"       + topic);
+        args.add(prefix + ":state:v:"   + topic);
+        args.add(prefix + ":state:j:"   + topic);
+        args.add(prefix + ":ch:up:"     + topic);
+        args.add(prefix + ":ch:del:"    + topic);
+        args.add(prefix + ":prodver:"   + topic + ":" + producerId);
 
-        // ARGV
-        args.add(String.valueOf(leaderEpoch));              // ARGV[1]
-        args.add(String.valueOf(plan.msgTs()));             // ARGV[2]
-        args.add(String.valueOf(plan.upserts().size()));    // ARGV[3]
+        args.add(String.valueOf(leaderEpoch));
+        args.add(String.valueOf(plan.msgTs()));
+        args.add(String.valueOf(plan.upserts().size()));
 
-        for (var item : plan.upserts()) {                  // ARGV[4 .. 4+nUpserts*3-1]
+        for (var item : plan.upserts()) {
             args.add(item.itemId());
             args.add(String.valueOf(item.version()));
             args.add(item.dataJson());
         }
 
-        args.add(String.valueOf(plan.deletes().size()));    // ARGV[4+nUpserts*3]
-        args.addAll(plan.deletes());                        // ARGV[4+nUpserts*3+1 ..]
+        args.add(String.valueOf(plan.deletes().size()));
+        args.addAll(plan.deletes());
 
         return args;
     }
 
     /**
      * Parses the Lua multi-bulk reply into a {@link CommitResult}.
-     *
-     * <p>Reply layout: {@code [status, firstSeq, lastSeq, upserts, deletes]}.
+     * Reply layout: {@code [status, firstSeq, lastSeq, upserts, deletes]}.
      */
     private CommitResult parseResponse(Response response) {
-        String status    = response.get(0).toString();
-        long   firstSeq  = response.get(1).toLong();
-        long   lastSeq   = response.get(2).toLong();
-        int    upserts   = response.get(3).toLong().intValue();
-        int    deletes   = response.get(4).toLong().intValue();
+        String status   = response.get(0).toString();
+        long   firstSeq = response.get(1).toLong();
+        long   lastSeq  = response.get(2).toLong();
+        int    upserts  = response.get(3).toLong().intValue();
+        int    deletes  = response.get(4).toLong().intValue();
         return new CommitResult(CommitStatus.valueOf(status), firstSeq, lastSeq, upserts, deletes);
     }
 }

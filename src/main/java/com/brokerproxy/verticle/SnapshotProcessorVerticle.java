@@ -2,11 +2,12 @@ package com.brokerproxy.verticle;
 
 import com.brokerproxy.config.AppConfig;
 import com.brokerproxy.metrics.BrokerMetrics;
+import com.brokerproxy.model.CommitResult;
 import com.brokerproxy.model.RecencyResult;
 import com.brokerproxy.model.Snapshot;
 import com.brokerproxy.model.WritePlan;
 import com.brokerproxy.redis.RedisProvider;
-import com.brokerproxy.model.CommitResult;
+import com.brokerproxy.service.CommitExecutor;
 import com.brokerproxy.service.ComputersDiffEngine;
 import com.brokerproxy.service.LuaCommitScript;
 import com.brokerproxy.service.ProducerCacheDiffEngine;
@@ -24,31 +25,28 @@ import org.slf4j.LoggerFactory;
  * Event-loop verticle that receives parsed {@link Snapshot} objects from the
  * event bus and drives the processing pipeline.
  *
- * <h3>Current pipeline (BE-05)</h3>
+ * <h3>Current pipeline (BE-07)</h3>
  * <ol>
  *   <li>Receive snapshot JSON from {@code bp.snapshot.{topic}}</li>
- *   <li>Recency gate — drop if {@code msgTs <= lastAccepted} stored in Redis</li>
- *   <li>Diff engine — compute {@link WritePlan} for all three topics</li>
- *   <li>Log plan size + metrics</li>
+ *   <li>Recency gate — early drop if {@code msgTs <= lastAccepted}</li>
+ *   <li>Diff engine — compute {@link WritePlan} (per-topic)</li>
+ *   <li>Atomic commit via {@link CommitExecutor} (EVALSHA + retry + metrics)</li>
  *   <li>Reply to release the {@link JmsConsumerVerticle} backpressure semaphore</li>
  * </ol>
- *
- * <h3>Future pipeline extensions</h3>
- * <ul>
- *   <li>BE-06 — atomic Lua commit (recency write moved there, updateRecency() removed)</li>
- * </ul>
  */
 public class SnapshotProcessorVerticle extends AbstractVerticle {
 
     private static final Logger log = LoggerFactory.getLogger(SnapshotProcessorVerticle.class);
 
+    private static final int DEFAULT_MAX_RETRIES   = 2;
+    private static final int DEFAULT_RETRY_DELAY   = 200;   // ms between retries
+
     // ---- Instance state (safe: one instance per deployment) ----------------------
 
     private RecencyGate             recencyGate;
     private ComputersDiffEngine     computersDiffEngine;
-    private ProducerCacheDiffEngine multiItemDiffEngine;   // headsets + conferences
-    private LuaCommitScript         commitScript;
-    private long                    leaderEpoch;
+    private ProducerCacheDiffEngine multiItemDiffEngine;
+    private CommitExecutor          commitExecutor;
 
     // ---- Lifecycle ---------------------------------------------------------------
 
@@ -60,9 +58,13 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
         recencyGate         = new RecencyGate(redisApi, config.redisPrefix());
         computersDiffEngine = new ComputersDiffEngine(redisApi, config.redisPrefix());
         multiItemDiffEngine = new ProducerCacheDiffEngine(redisApi, config.redisPrefix());
-        commitScript        = new LuaCommitScript(redisApi, config.redisPrefix());
-        leaderEpoch         = config.leaderEpoch();
 
+        LuaCommitScript script = new LuaCommitScript(redisApi, config.redisPrefix());
+        commitExecutor = new CommitExecutor(vertx, script, config.leaderEpoch(),
+                DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY);
+
+        // Register event bus consumers BEFORE loading the script so that
+        // no messages are lost during the SCRIPT LOAD round-trip.
         for (String topicName : config.topics()) {
             vertx.eventBus().<JsonObject>consumer(
                     JmsConsumerVerticle.SNAPSHOT_ADDR + topicName,
@@ -70,9 +72,20 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
             );
         }
 
-        log.info("event=snapshot_processor.started verticle=SnapshotProcessorVerticle "
-                + "topics={}", config.topics());
-        startPromise.complete();
+        // Load the Lua script into Redis cache; complete start only on success.
+        // Any commit before the SHA is cached will fall back to EVAL automatically.
+        script.loadScript()
+                .onSuccess(v -> {
+                    log.info("event=snapshot_processor.started "
+                            + "verticle=SnapshotProcessorVerticle topics={}",
+                            config.topics());
+                    startPromise.complete();
+                })
+                .onFailure(err -> {
+                    log.error("event=snapshot_processor.start_failed error=\"{}\"",
+                            err.getMessage());
+                    startPromise.fail(err);
+                });
     }
 
     // ---- Processing pipeline ----------------------------------------------------
@@ -98,7 +111,6 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
     private void handleRecencyResult(Message<JsonObject> msg, Snapshot snapshot,
                                      RecencyResult result) {
         if (!result.wasAccepted()) {
-            // ---- Drop -----------------------------------------------------------
             log.info("event=snapshot.dropped topic={} producerId={} msgTs={} "
                             + "lastAcceptedTs={} reason=RECENCY",
                     snapshot.topic(), snapshot.producerId(),
@@ -110,11 +122,9 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
             return;
         }
 
-        // ---- Accept: log + diff -------------------------------------------------
         log.info("event=snapshot.accepted topic={} producerId={} msgTs={} itemCount={}",
                 snapshot.topic(), snapshot.producerId(),
                 snapshot.msgTs(), snapshot.items().size());
-
         BrokerMetrics.snapshotReceived(snapshot.topic());
 
         runDiff(snapshot)
@@ -131,37 +141,18 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
                 });
     }
 
-    /**
-     * Dispatches to the correct diff engine for the snapshot's topic.
-     * <ul>
-     *   <li>{@code computers} — {@link ComputersDiffEngine} (single-item producer)</li>
-     *   <li>{@code headsets}, {@code conferences} — {@link ProducerCacheDiffEngine}
-     *       (multi-item producer)</li>
-     * </ul>
-     */
     private Future<WritePlan> runDiff(Snapshot snapshot) {
         return switch (snapshot.topic()) {
-            case "computers"    -> computersDiffEngine.diff(snapshot);
+            case "computers"   -> computersDiffEngine.diff(snapshot);
             case "headsets",
-                 "conferences"  -> multiItemDiffEngine.diff(snapshot);
-            default             -> Future.succeededFuture(
+                 "conferences" -> multiItemDiffEngine.diff(snapshot);
+            default            -> Future.succeededFuture(
                     WritePlan.noop(snapshot.topic(), snapshot.producerId(), snapshot.msgTs()));
         };
     }
 
-    /**
-     * Executes the atomic Lua commit and replies to release the JMS semaphore.
-     *
-     * <p>The Lua script atomically:
-     * <ol>
-     *   <li>Verifies the leader epoch (fencing)</li>
-     *   <li>Verifies msgTs recency</li>
-     *   <li>Allocates SEQs and writes state, change-indices, prodver cache</li>
-     *   <li>Updates the recency key</li>
-     * </ol>
-     */
     private void commitPlan(Message<JsonObject> msg, Snapshot snapshot, WritePlan plan) {
-        commitScript.eval(plan, leaderEpoch)
+        commitExecutor.commit(plan)
                 .onSuccess(result -> handleCommitResult(msg, snapshot, result))
                 .onFailure(err -> {
                     log.error("event=commit.error topic={} producerId={} msgTs={} error=\"{}\"",
@@ -192,10 +183,8 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
                         .put("deletes",  result.appliedDeletes()));
             }
             case FENCED -> {
-                log.warn("event=commit.fenced topic={} producerId={} msgTs={} "
-                                + "leaderEpoch={}",
-                        snapshot.topic(), snapshot.producerId(),
-                        snapshot.msgTs(), leaderEpoch);
+                log.warn("event=commit.fenced topic={} producerId={} msgTs={}",
+                        snapshot.topic(), snapshot.producerId(), snapshot.msgTs());
                 BrokerMetrics.fencingDenied();
                 BrokerMetrics.snapshotDropped(snapshot.topic(), BrokerMetrics.REASON_FENCED);
                 msg.reply(new JsonObject()
@@ -203,7 +192,6 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
                         .put("reason", BrokerMetrics.REASON_FENCED));
             }
             case DROPPED_RECENCY -> {
-                // Late recency detection (Lua saw a race the Java check missed)
                 log.info("event=commit.dropped_recency topic={} producerId={} msgTs={}",
                         snapshot.topic(), snapshot.producerId(), snapshot.msgTs());
                 BrokerMetrics.snapshotDropped(snapshot.topic(), BrokerMetrics.REASON_RECENCY);

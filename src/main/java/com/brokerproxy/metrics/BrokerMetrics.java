@@ -27,6 +27,8 @@ public final class BrokerMetrics {
     public static final String SNAPSHOTS_NOOP      = "brokerproxy_snapshots_noop_total";
     public static final String VERSION_ANOMALY     = "brokerproxy_version_anomaly_total";
     public static final String COMMIT_DURATION     = "brokerproxy_redis_commit_duration_seconds";
+    public static final String COMMIT_TOTAL        = "brokerproxy_commit_total";
+    public static final String COMMIT_FAIL_TOTAL   = "brokerproxy_commit_fail_total";
     public static final String LEADERSHIP_CHANGES  = "brokerproxy_leadership_changes_total";
     public static final String FENCING_DENIED      = "brokerproxy_fencing_denied_total";
 
@@ -67,7 +69,17 @@ public final class BrokerMetrics {
         counter(VERSION_ANOMALY, "topic", topic);
     }
 
-    // ---- Redis commit histogram (populated in BE-07) ----------------------------
+    // ---- Redis commit histogram + counters (BE-07) ------------------------------
+
+    /** Increments {@code bp_commit_total{topic, status}} on every commit attempt. */
+    public static void commitTotal(String topic, String status) {
+        counter(COMMIT_TOTAL, "topic", topic, "status", status);
+    }
+
+    /** Increments {@code bp_commit_fail_total{topic, cause}} on commit I/O failure. */
+    public static void commitFailTotal(String topic, String cause) {
+        counter(COMMIT_FAIL_TOTAL, "topic", topic, "cause", cause);
+    }
 
     public static void recordCommitDuration(String topic, long durationMs) {
         MeterRegistry r = registry();
