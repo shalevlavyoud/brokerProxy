@@ -1,0 +1,44 @@
+<!--
+  Structured JSON logging via logstash-logback-encoder.
+
+  Every log line is a single JSON object. MDC fields are automatically
+  included as top-level keys, enabling correlation by:
+    - correlationId   (set per HTTP request or snapshot processing cycle)
+    - topic           (ActiveMQ topic being processed)
+    - producerId      (snapshot producer)
+
+  Root level is INFO for production. Override via LOGGING_LEVEL_ROOT env var
+  or add a <logger> element below for package-level tuning.
+-->
+<configuration>
+
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <!-- Rename standard fields to keep JSON compact -->
+      <fieldNames>
+        <timestamp>ts</timestamp>
+        <version>[ignore]</version>
+        <levelValue>[ignore]</levelValue>
+        <logger>logger</logger>
+        <thread>thread</thread>
+        <level>level</level>
+        <message>msg</message>
+        <stackTrace>stackTrace</stackTrace>
+      </fieldNames>
+      <!-- Include MDC fields (correlationId, topic, producerId) as top-level keys -->
+      <includeMdcKeyName>correlationId</includeMdcKeyName>
+      <includeMdcKeyName>topic</includeMdcKeyName>
+      <includeMdcKeyName>producerId</includeMdcKeyName>
+    </encoder>
+  </appender>
+
+  <!-- Quiet noisy Vert.x internals unless debugging -->
+  <logger name="io.vertx"         level="WARN"/>
+  <logger name="io.netty"         level="WARN"/>
+  <logger name="com.brokerproxy"  level="INFO"/>
+
+  <root level="INFO">
+    <appender-ref ref="STDOUT"/>
+  </root>
+
+</configuration>

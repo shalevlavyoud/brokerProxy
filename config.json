@@ -1,0 +1,24 @@
+{
+  "http": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+  "redis": {
+    "host": "localhost",
+    "port": 6379,
+    "prefix": "bp",
+    "connectTimeout": 5000,
+    "commitTimeout": 5000
+  },
+  "topics": ["computers", "headsets", "conferences"],
+  "activemq": {
+    "brokerUrl": "tcp://localhost:61616"
+  },
+  "retention": {
+    "windowSize": 10000
+  },
+  "guardrails": {
+    "maxDataJsonBytes": 65536,
+    "maxChangesPerCommit": 1000
+  }
+}

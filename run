@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run the Broker Proxy fat JAR.
+# Usage:  ./run
+#         HTTP_PORT=9090 ./run
+set -euo pipefail
+
+JAR="target/broker-proxy-1.0.0-SNAPSHOT.jar"
+
+if [ ! -f "$JAR" ]; then
+  echo "[run] JAR not found — building first..."
+  mvn package -DskipTests -q
+fi
+
+exec java -jar "$JAR" "$@"
