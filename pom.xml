@@ -35,7 +35,7 @@
     <!-- Plugin versions -->
     <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
     <maven-surefire-plugin.version>3.2.5</maven-surefire-plugin.version>
-    <maven-shade-plugin.version>3.5.3</maven-shade-plugin.version>
+    <maven-shade-plugin.version>3.6.2</maven-shade-plugin.version>
 
     <!-- Build-info injected into version.properties via resource filtering -->
     <build.timestamp>${maven.build.timestamp}</build.timestamp>
