@@ -78,7 +78,7 @@ jobs:
       # ── Upload Surefire HTML + XML reports ───────────────────────────────────
       - name: Upload unit test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-test-reports-${{ github.run_number }}
           retention-days: 14
@@ -157,7 +157,7 @@ jobs:
       # ── Upload Failsafe HTML + XML reports ───────────────────────────────────
       - name: Upload integration test reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: integration-test-reports-${{ github.run_number }}
           retention-days: 14
