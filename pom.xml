@@ -24,7 +24,7 @@
 
     <!-- Dependency versions -->
     <vertx.version>4.5.11</vertx.version>
-    <log4j.version>2.24.3</log4j.version>
+    <log4j.version>2.25.3</log4j.version>
     <!-- Must match Vert.x 4.5.x compile-time micrometer version (1.13+ renamed the
          Prometheus registry class; vertx-micrometer-metrics expects the 1.12.x package) -->
     <micrometer.version>1.12.6</micrometer.version>
