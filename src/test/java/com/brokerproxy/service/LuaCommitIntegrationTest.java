@@ -102,8 +102,8 @@ class LuaCommitIntegrationTest {
         // Change index: item-A at seq=1 in upserts zset
         assertZscore("bp:ch:up:computers", "item-A", 1.0);
 
-        // Producer version cache updated
-        assertHsetField("bp:prodver:computers:prod-1", "item-A", "5");
+        // Producer version cache updated (scalar key for computers)
+        assertStringKey("bp:compver:computers:prod-1", "item-A|5");
 
         // Recency updated
         assertStringKey("bp:recency:computers:prod-1", "100");
@@ -198,6 +198,10 @@ class LuaCommitIntegrationTest {
         // h-1 at seq=1, h-2 at seq=2
         assertZscore("bp:ch:up:headsets", "h-1", 1.0);
         assertZscore("bp:ch:up:headsets", "h-2", 2.0);
+
+        // Headsets uses Hash prodver (isScalar=0 path)
+        assertHsetField("bp:prodver:headsets:prod-h", "h-1", "1");
+        assertHsetField("bp:prodver:headsets:prod-h", "h-2", "1");
     }
 
     @Test
@@ -229,7 +233,8 @@ class LuaCommitIntegrationTest {
         // First, seed state as if a previous commit put item-X there
         await(api.hset(List.of("bp:state:v:computers", "item-X", "3")));
         await(api.hset(List.of("bp:state:j:computers", "item-X", "{\"old\":true}")));
-        await(api.hset(List.of("bp:prodver:computers:prod-7", "item-X", "3")));
+        // Computers uses scalar key: "bp:compver:computers:{producerId}" = "itemId|version"
+        await(api.set(List.of("bp:compver:computers:prod-7", "item-X|3")));
 
         WritePlan plan = new WritePlan("computers", "prod-7", 400L,
                 List.of(), List.of("item-X"));
@@ -243,8 +248,8 @@ class LuaCommitIntegrationTest {
         // item-X must be gone from state
         var stateV = await(api.hget("bp:state:v:computers", "item-X"));
         assertThat(stateV).isNull();
-        var prodVer = await(api.hget("bp:prodver:computers:prod-7", "item-X"));
-        assertThat(prodVer).isNull();
+        // Scalar compver key must have been DELeted (pure delete, no upsert)
+        assertKeyAbsent("bp:compver:computers:prod-7");
 
         // item-X must appear in the deletes change-index
         assertZscore("bp:ch:del:computers", "item-X", 1.0);

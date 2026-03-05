@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Structured JSON logging via Log4j2 JsonLayout (fully XML-configured).
+
+  Every log line is a single compact JSON object written to STDOUT.
+  ThreadContext (Log4j2's MDC equivalent) fields appear under "contextMap",
+  enabling log-aggregator correlation by:
+    - correlationId   (set per HTTP request or snapshot processing cycle)
+    - topic           (ActiveMQ topic being processed)
+    - producerId      (snapshot producer)
+
+  Root level is INFO for production.
+-->
+<Configuration status="WARN">
+
+  <Appenders>
+    <Console name="STDOUT" target="SYSTEM_OUT">
+      <!--
+        JsonLayout attributes:
+          compact         – one JSON object per line (no pretty-print)
+          eventEol        – append a newline after each event
+          properties      – include ThreadContext (MDC) map as "contextMap"
+          propertiesAsList – emit contextMap as an object, not an array
+          includeStacktrace  – include exception detail in "thrown"
+          stacktraceAsString – flatten the stack trace to a single string
+      -->
+      <JsonLayout compact="true" eventEol="true"
+                  properties="true" propertiesAsList="false"
+                  includeStacktrace="true" stacktraceAsString="true"/>
+    </Console>
+  </Appenders>
+
+  <Loggers>
+    <!-- Quiet noisy Vert.x / Netty internals unless debugging -->
+    <Logger name="io.vertx"        level="WARN"  additivity="false">
+      <AppenderRef ref="STDOUT"/>
+    </Logger>
+    <Logger name="io.netty"        level="WARN"  additivity="false">
+      <AppenderRef ref="STDOUT"/>
+    </Logger>
+    <Logger name="com.brokerproxy" level="INFO"  additivity="false">
+      <AppenderRef ref="STDOUT"/>
+    </Logger>
+
+    <Root level="INFO">
+      <AppenderRef ref="STDOUT"/>
+    </Root>
+  </Loggers>
+
+</Configuration>

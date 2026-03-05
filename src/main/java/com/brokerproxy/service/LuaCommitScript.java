@@ -1,5 +1,6 @@
 package com.brokerproxy.service;
 
+import com.brokerproxy.config.AppConfig;
 import com.brokerproxy.model.CommitResult;
 import com.brokerproxy.model.CommitResult.CommitStatus;
 import com.brokerproxy.model.WritePlan;
@@ -46,17 +47,19 @@ import java.util.List;
  *   KEYS[5]  bp:state:j:{topic}
  *   KEYS[6]  bp:ch:up:{topic}
  *   KEYS[7]  bp:ch:del:{topic}
- *   KEYS[8]  bp:prodver:{topic}:{producerId}
+ *   KEYS[8]  bp:compver:computers:{producerId}  (computers — scalar String "itemId|version")
+ *            OR bp:prodver:{topic}:{producerId}  (headsets/conferences — Hash itemId→version)
  * </pre>
  *
  * <h3>ARGV layout</h3>
  * <pre>
- *   ARGV[1]                          expectedEpoch
- *   ARGV[2]                          msgTs
- *   ARGV[3]                          nUpserts
- *   ARGV[4 .. 4+nUpserts*3-1]        upserts: (itemId, version, dataJson) × nUpserts
- *   ARGV[4+nUpserts*3]               nDeletes
- *   ARGV[4+nUpserts*3+1 ..]          deletes: itemId × nDeletes
+ *   ARGV[1]                          isScalar (1 = computers scalar key, 0 = hash key)
+ *   ARGV[2]                          expectedEpoch
+ *   ARGV[3]                          msgTs
+ *   ARGV[4]                          nUpserts
+ *   ARGV[5 .. 5+nUpserts*3-1]        upserts: (itemId, version, dataJson) × nUpserts
+ *   ARGV[5+nUpserts*3]               nDeletes
+ *   ARGV[5+nUpserts*3+1 ..]          deletes: itemId × nDeletes
  * </pre>
  */
 public class LuaCommitScript {
@@ -66,27 +69,35 @@ public class LuaCommitScript {
     // ---- Lua script text --------------------------------------------------------
 
     /**
-     * The Lua commit script.  Kept as a constant so callers can run
-     * {@code SCRIPT LOAD} and receive a SHA to use with {@code EVALSHA}.
+     * The Lua commit script v2.  Keeps all writes atomic.
      *
      * <p>Invariant: no partial state can be observed — all guards (fencing,
      * recency) abort with zero writes if triggered.
+     *
+     * <p>{@code KEYS[8]} is written differently depending on {@code ARGV[1]}:
+     * <ul>
+     *   <li>{@code isScalar=1} (computers): {@code SET KEYS[8] "itemId|version"} on
+     *       upsert; {@code DEL KEYS[8]} on pure-delete (no accompanying upsert).</li>
+     *   <li>{@code isScalar=0} (headsets/conferences): {@code HSET}/{@code HDEL}
+     *       per item as before.</li>
+     * </ul>
      */
     static final String SCRIPT = """
-            -- bp-commit-v1: fencing + recency + seq + state + indices (atomic)
+            -- bp-commit-v2: isScalar flag + fencing + recency + seq + state + indices (atomic)
+            local isScalar    = tonumber(ARGV[1]) or 0
             local storedEpoch = redis.call('GET', KEYS[1])
             if storedEpoch == false then storedEpoch = '0' end
-            if storedEpoch ~= ARGV[1] then
+            if storedEpoch ~= ARGV[2] then
                 return {'FENCED', -1, -1, 0, 0}
             end
             local lastAccepted = redis.call('GET', KEYS[2])
             if lastAccepted ~= false then
-                if tonumber(ARGV[2]) <= tonumber(lastAccepted) then
+                if tonumber(ARGV[3]) <= tonumber(lastAccepted) then
                     return {'DROPPED_RECENCY', -1, -1, 0, 0}
                 end
             end
-            local nUpserts      = tonumber(ARGV[3])
-            local deleteArgBase = 4 + nUpserts * 3
+            local nUpserts      = tonumber(ARGV[4])
+            local deleteArgBase = 5 + nUpserts * 3
             local nDeletes      = tonumber(ARGV[deleteArgBase])
             local nChanges      = nUpserts + nDeletes
             local firstSeq = -1
@@ -99,7 +110,7 @@ public class LuaCommitScript {
                 lastSeq  = topSeq
             end
             for i = 0, nUpserts - 1 do
-                local base     = 4 + i * 3
+                local base     = 5 + i * 3
                 local itemId   = ARGV[base]
                 local version  = ARGV[base + 1]
                 local dataJson = ARGV[base + 2]
@@ -107,7 +118,11 @@ public class LuaCommitScript {
                 redis.call('HSET', KEYS[4], itemId, version)
                 redis.call('HSET', KEYS[5], itemId, dataJson)
                 redis.call('ZADD', KEYS[6], seq, itemId)
-                redis.call('HSET', KEYS[8], itemId, version)
+                if isScalar == 1 then
+                    redis.call('SET', KEYS[8], itemId .. '|' .. version)
+                else
+                    redis.call('HSET', KEYS[8], itemId, version)
+                end
             end
             for i = 0, nDeletes - 1 do
                 local itemId = ARGV[deleteArgBase + 1 + i]
@@ -115,9 +130,14 @@ public class LuaCommitScript {
                 redis.call('HDEL', KEYS[4], itemId)
                 redis.call('HDEL', KEYS[5], itemId)
                 redis.call('ZADD', KEYS[7], seq, itemId)
-                redis.call('HDEL', KEYS[8], itemId)
+                if isScalar == 0 then
+                    redis.call('HDEL', KEYS[8], itemId)
+                end
             end
-            redis.call('SET', KEYS[2], ARGV[2])
+            if isScalar == 1 and nDeletes > 0 and nUpserts == 0 then
+                redis.call('DEL', KEYS[8])
+            end
+            redis.call('SET', KEYS[2], ARGV[3])
             return {'OK', firstSeq, lastSeq, nUpserts, nDeletes}
             """;
 
@@ -125,6 +145,11 @@ public class LuaCommitScript {
 
     private final RedisAPI redis;
     private final String   prefix;
+    /**
+     * Maximum allowed total changes (upserts + deletes) per commit plan.
+     * Plans exceeding this limit are rejected before being sent to Redis.
+     */
+    private final int      maxChangesPerCommit;
 
     /**
      * Cached SHA1 from {@code SCRIPT LOAD}.  {@code null} until {@link #loadScript}
@@ -134,9 +159,16 @@ public class LuaCommitScript {
      */
     private volatile String sha = null;
 
+    /** Convenience constructor for tests — uses the default guardrail limit. */
     public LuaCommitScript(RedisAPI redis, String prefix) {
-        this.redis  = redis;
-        this.prefix = prefix;
+        this(redis, prefix, AppConfig.DEFAULT_MAX_CHANGES_PER_COMMIT);
+    }
+
+    /** Full constructor for production use. */
+    public LuaCommitScript(RedisAPI redis, String prefix, int maxChangesPerCommit) {
+        this.redis               = redis;
+        this.prefix              = prefix;
+        this.maxChangesPerCommit = maxChangesPerCommit;
     }
 
     // ---- Public API -------------------------------------------------------------
@@ -172,8 +204,18 @@ public class LuaCommitScript {
      * @param leaderEpoch   the epoch this instance believes it holds
      */
     public Future<CommitResult> eval(WritePlan plan, long leaderEpoch) {
-        List<String> common = buildCommonArgs(plan, leaderEpoch);
-        String currentSha   = this.sha;
+        int totalChanges = plan.upserts().size() + plan.deletes().size();
+        if (totalChanges > maxChangesPerCommit) {
+            log.warn("event=commit_script.too_many_changes topic={} producerId={} "
+                            + "changes={} max={}",
+                    plan.topic(), plan.producerId(), totalChanges, maxChangesPerCommit);
+            return Future.failedFuture(new IllegalArgumentException(
+                    "commit plan exceeds maxChangesPerCommit: "
+                            + totalChanges + " > " + maxChangesPerCommit));
+        }
+
+        List<String> common    = buildCommonArgs(plan, leaderEpoch);
+        String       currentSha = this.sha;
 
         if (currentSha != null) {
             return evalSha(currentSha, common)
@@ -223,26 +265,41 @@ public class LuaCommitScript {
      * Builds the common argument segment shared by {@code EVAL} and {@code EVALSHA}:
      * {@code [numkeys, key1..key8, argv1..argN]}.
      *
-     * <p>The script text or SHA is prepended by the caller.
+     * <p>KEYS[8] is topic-dependent:
+     * <ul>
+     *   <li>computers → {@code bp:compver:computers:{producerId}} (scalar String)</li>
+     *   <li>others    → {@code bp:prodver:{topic}:{producerId}}   (Hash)</li>
+     * </ul>
+     *
+     * <p>ARGV[1] = {@code isScalar} ("1" for computers, "0" for others) tells
+     * the Lua script which Redis command to use on KEYS[8].
      */
     private List<String> buildCommonArgs(WritePlan plan, long leaderEpoch) {
-        String topic      = plan.topic();
-        String producerId = plan.producerId();
+        String  topic      = plan.topic();
+        String  producerId = plan.producerId();
+        boolean isScalar   = "computers".equals(topic);
 
         List<String> args = new ArrayList<>();
         args.add("8");   // numkeys
         args.add(prefix + ":leader:epoch");
         args.add(prefix + ":recency:"  + topic + ":" + producerId);
-        args.add(prefix + ":seq:"       + topic);
-        args.add(prefix + ":state:v:"   + topic);
-        args.add(prefix + ":state:j:"   + topic);
-        args.add(prefix + ":ch:up:"     + topic);
-        args.add(prefix + ":ch:del:"    + topic);
-        args.add(prefix + ":prodver:"   + topic + ":" + producerId);
+        args.add(prefix + ":seq:"      + topic);
+        args.add(prefix + ":state:v:"  + topic);
+        args.add(prefix + ":state:j:"  + topic);
+        args.add(prefix + ":ch:up:"    + topic);
+        args.add(prefix + ":ch:del:"   + topic);
+        // KEYS[8]: scalar key for computers, hash key for headsets/conferences
+        if (isScalar) {
+            args.add(prefix + ":compver:" + topic + ":" + producerId);
+        } else {
+            args.add(prefix + ":prodver:" + topic + ":" + producerId);
+        }
 
-        args.add(String.valueOf(leaderEpoch));
-        args.add(String.valueOf(plan.msgTs()));
-        args.add(String.valueOf(plan.upserts().size()));
+        // ARGV
+        args.add(isScalar ? "1" : "0");               // ARGV[1]: isScalar
+        args.add(String.valueOf(leaderEpoch));         // ARGV[2]: expectedEpoch
+        args.add(String.valueOf(plan.msgTs()));        // ARGV[3]: msgTs
+        args.add(String.valueOf(plan.upserts().size())); // ARGV[4]: nUpserts
 
         for (var item : plan.upserts()) {
             args.add(item.itemId());
@@ -250,7 +307,7 @@ public class LuaCommitScript {
             args.add(item.dataJson());
         }
 
-        args.add(String.valueOf(plan.deletes().size()));
+        args.add(String.valueOf(plan.deletes().size())); // ARGV[5+nUpserts*3]: nDeletes
         args.addAll(plan.deletes());
 
         return args;

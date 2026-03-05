@@ -1,19 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Plain-text console logging for tests — avoids JSON noise in CI output
-  while still exercising the full application code path.
+  MIGRATED: Logging has been migrated from Logback to Log4j 2.
+  This file is no longer used. See log4j2-test.xml for the active configuration.
 -->
-<configuration>
-  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
-    <encoder>
-      <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
-    </encoder>
-  </appender>
-
-  <logger name="io.vertx" level="WARN"/>
-  <logger name="io.netty"  level="WARN"/>
-  <logger name="com.brokerproxy" level="DEBUG"/>
-
-  <root level="INFO">
-    <appender-ref ref="STDOUT"/>
-  </root>
-</configuration>
+<configuration/>

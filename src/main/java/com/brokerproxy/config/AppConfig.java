@@ -27,6 +27,10 @@ public record AppConfig(
         int redisPort,
         String redisPrefix,
         int redisConnectTimeoutMs,
+        /** Redis AUTH password; {@code null} means no authentication. */
+        String redisPassword,
+        /** Whether to enable TLS for the Redis connection. */
+        boolean redisSsl,
         int commitTimeoutMs,
         /**
          * The epoch this instance believes it is the leader for.
@@ -59,7 +63,15 @@ public record AppConfig(
 
         // ---- Guardrails ----
         int maxDataJsonBytes,
-        int maxChangesPerCommit
+        int maxChangesPerCommit,
+
+        // ---- Changes read-path ----
+        /** Default page size for {@code GET /changes}; applied when no {@code limit} param given. */
+        int changesDefaultLimit,
+        /** Hard cap on the {@code limit} param for {@code GET /changes}. */
+        int changesMaxLimit,
+        /** Per-request Redis query timeout for {@code GET /changes} (ms). */
+        int changesQueryTimeoutMs
 
 ) {
 
@@ -72,6 +84,7 @@ public record AppConfig(
     public static final int     DEFAULT_REDIS_PORT              = 6379;
     public static final String  DEFAULT_REDIS_PREFIX            = "bp";
     public static final int     DEFAULT_REDIS_CONNECT_TIMEOUT   = 5_000;
+    public static final boolean DEFAULT_REDIS_SSL               = false;
     public static final int     DEFAULT_COMMIT_TIMEOUT          = 5_000;
     public static final long    DEFAULT_LEADER_EPOCH            = 1L;
 
@@ -88,6 +101,10 @@ public record AppConfig(
     public static final int     DEFAULT_MAX_DATA_JSON_BYTES     = 65_536;   // 64 KiB
     public static final int     DEFAULT_MAX_CHANGES_PER_COMMIT  = 1_000;
 
+    public static final int     DEFAULT_CHANGES_DEFAULT_LIMIT   = 100;
+    public static final int     DEFAULT_CHANGES_MAX_LIMIT        = 1_000;
+    public static final int     DEFAULT_CHANGES_QUERY_TIMEOUT    = 5_000;
+
     // ---- Factory -----------------------------------------------------------------
 
     /**
@@ -103,6 +120,7 @@ public record AppConfig(
         JsonObject jms       = json.getJsonObject("jms",        new JsonObject());
         JsonObject retention = json.getJsonObject("retention",  new JsonObject());
         JsonObject guard     = json.getJsonObject("guardrails", new JsonObject());
+        JsonObject changes   = json.getJsonObject("changes",    new JsonObject());
 
         JsonArray topicsArr  = json.getJsonArray("topics",
                 new JsonArray().add("computers").add("headsets").add("conferences"));
@@ -118,6 +136,8 @@ public record AppConfig(
                 redis.getInteger("port",           DEFAULT_REDIS_PORT),
                 redis.getString("prefix",          DEFAULT_REDIS_PREFIX),
                 redis.getInteger("connectTimeout", DEFAULT_REDIS_CONNECT_TIMEOUT),
+                redis.getString ("password",       null),
+                redis.getBoolean("ssl",            DEFAULT_REDIS_SSL),
                 redis.getInteger("commitTimeout",  DEFAULT_COMMIT_TIMEOUT),
                 redis.getLong   ("leaderEpoch",    DEFAULT_LEADER_EPOCH),
                 topics,
@@ -127,7 +147,10 @@ public record AppConfig(
                 jms.getInteger("maxPendingPerTopic",      DEFAULT_JMS_MAX_PENDING),
                 jms.getInteger("processingTimeoutMs",     DEFAULT_JMS_PROCESSING_TIMEOUT),
                 guard.getInteger("maxDataJsonBytes",      DEFAULT_MAX_DATA_JSON_BYTES),
-                guard.getInteger("maxChangesPerCommit",   DEFAULT_MAX_CHANGES_PER_COMMIT)
+                guard.getInteger("maxChangesPerCommit",   DEFAULT_MAX_CHANGES_PER_COMMIT),
+                changes.getInteger("defaultLimit",        DEFAULT_CHANGES_DEFAULT_LIMIT),
+                changes.getInteger("maxLimit",            DEFAULT_CHANGES_MAX_LIMIT),
+                changes.getInteger("queryTimeoutMs",      DEFAULT_CHANGES_QUERY_TIMEOUT)
         );
     }
 }

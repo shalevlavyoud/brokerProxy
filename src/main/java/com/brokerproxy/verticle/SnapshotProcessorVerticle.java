@@ -56,12 +56,15 @@ public class SnapshotProcessorVerticle extends AbstractVerticle {
         RedisAPI  redisApi = RedisProvider.createApi(vertx, config);
 
         recencyGate         = new RecencyGate(redisApi, config.redisPrefix());
-        computersDiffEngine = new ComputersDiffEngine(redisApi, config.redisPrefix());
-        multiItemDiffEngine = new ProducerCacheDiffEngine(redisApi, config.redisPrefix());
+        computersDiffEngine = new ComputersDiffEngine(
+                redisApi, config.redisPrefix(), config.maxDataJsonBytes());
+        multiItemDiffEngine = new ProducerCacheDiffEngine(
+                redisApi, config.redisPrefix(), config.maxDataJsonBytes());
 
-        LuaCommitScript script = new LuaCommitScript(redisApi, config.redisPrefix());
+        LuaCommitScript script = new LuaCommitScript(
+                redisApi, config.redisPrefix(), config.maxChangesPerCommit());
         commitExecutor = new CommitExecutor(vertx, script, config.leaderEpoch(),
-                DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY);
+                DEFAULT_MAX_RETRIES, DEFAULT_RETRY_DELAY, config.commitTimeoutMs());
 
         // Register event bus consumers BEFORE loading the script so that
         // no messages are lost during the SCRIPT LOAD round-trip.

@@ -31,6 +31,11 @@ public final class BrokerMetrics {
     public static final String COMMIT_FAIL_TOTAL   = "brokerproxy_commit_fail_total";
     public static final String LEADERSHIP_CHANGES  = "brokerproxy_leadership_changes_total";
     public static final String FENCING_DENIED      = "brokerproxy_fencing_denied_total";
+    public static final String OVERSIZED_PAYLOAD   = "brokerproxy_oversized_payload_total";
+
+    public static final String CHANGES_REQUESTS       = "brokerproxy_changes_requests_total";
+    public static final String CHANGES_ITEMS_RETURNED = "brokerproxy_changes_items_returned_total";
+    public static final String CHANGES_DURATION       = "brokerproxy_changes_request_duration_seconds";
 
     // Drop reason tags (used across multiple tasks)
     public static final String REASON_RECENCY      = "RECENCY";
@@ -57,8 +62,25 @@ public final class BrokerMetrics {
         counter(ITEMS_UPSERT, "topic", topic);
     }
 
+    /** Increments the upsert counter by {@code count} in a single call. */
+    public static void itemUpsertCount(String topic, int count) {
+        if (count <= 0) return;
+        counterBy(ITEMS_UPSERT, count, "topic", topic);
+    }
+
     public static void itemDelete(String topic) {
         counter(ITEMS_DELETE, "topic", topic);
+    }
+
+    /** Increments the delete counter by {@code count} in a single call. */
+    public static void itemDeleteCount(String topic, int count) {
+        if (count <= 0) return;
+        counterBy(ITEMS_DELETE, count, "topic", topic);
+    }
+
+    /** Increments the oversized-payload drop counter for the given topic. */
+    public static void oversizedPayload(String topic) {
+        counter(OVERSIZED_PAYLOAD, "topic", topic);
     }
 
     public static void snapshotNoop(String topic) {
@@ -90,6 +112,29 @@ public final class BrokerMetrics {
                 .record(durationMs, TimeUnit.MILLISECONDS);
     }
 
+    // ---- Changes read-path metrics (BE-08) --------------------------------------
+
+    /** Increments {@code brokerproxy_changes_requests_total{topic, status=success|error}}. */
+    public static void changesRequest(String topic, String status) {
+        counter(CHANGES_REQUESTS, "topic", topic, "status", status);
+    }
+
+    /** Increments {@code brokerproxy_changes_items_returned_total{topic}} by {@code n}. */
+    public static void changesItemsReturned(String topic, int n) {
+        if (n <= 0) return;
+        counterBy(CHANGES_ITEMS_RETURNED, n, "topic", topic);
+    }
+
+    /** Records the total request duration for {@code GET /changes} as a histogram. */
+    public static void recordChangesDuration(String topic, long durationMs) {
+        MeterRegistry r = registry();
+        if (r == null) return;
+        Timer.builder(CHANGES_DURATION)
+                .tag("topic", topic)
+                .register(r)
+                .record(durationMs, TimeUnit.MILLISECONDS);
+    }
+
     // ---- Leadership / fencing (populated in leader-election task) ---------------
 
     public static void leadershipChange() {
@@ -109,6 +154,16 @@ public final class BrokerMetrics {
                 .tags(tags)
                 .register(r)
                 .increment();
+    }
+
+    /** Increments a counter by a given amount — used for bulk operations. */
+    private static void counterBy(String name, double amount, String... tags) {
+        MeterRegistry r = registry();
+        if (r == null) return;
+        Counter.builder(name)
+                .tags(tags)
+                .register(r)
+                .increment(amount);
     }
 
     private static MeterRegistry registry() {

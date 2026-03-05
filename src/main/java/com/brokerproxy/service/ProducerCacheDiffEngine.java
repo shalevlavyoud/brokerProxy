@@ -6,7 +6,6 @@ import com.brokerproxy.model.SnapshotItem;
 import com.brokerproxy.model.WritePlan;
 import io.vertx.core.Future;
 import io.vertx.redis.client.RedisAPI;
-import io.vertx.redis.client.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,22 +15,23 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * General-purpose diff engine for all topics that use the
+ * General-purpose diff engine for topics that use the
  * {@code bp:prodver:{topic}:{producerId}} Hash as their baseline.
  *
- * <p>Handles {@code headsets} and {@code conferences} (multi-item producers)
- * as well as {@code computers} (single-item producer) via delegation from
- * {@link ComputersDiffEngine}.
+ * <p>Handles {@code headsets} and {@code conferences} (multi-item producers).
+ * For the {@code computers} topic (single-item producer) see
+ * {@link ComputersDiffEngine}, which uses a scalar key instead.
  *
  * <h3>Algorithm</h3>
  * <ol>
  *   <li>Read {@code HGETALL bp:prodver:{topic}:{producerId}} → {@code oldVersions}</li>
  *   <li>For each item in the incoming snapshot:
  *     <ul>
- *       <li>Not in cache → <b>UPSERT</b> (new item)</li>
+ *       <li>Not in cache → <b>UPSERT</b> (new item, if not oversized)</li>
  *       <li>Same version → <b>NOOP</b></li>
- *       <li>Higher version → <b>UPSERT</b></li>
+ *       <li>Higher version → <b>UPSERT</b> (if not oversized)</li>
  *       <li>Lower version → <b>VERSION_ANOMALY</b>: log warn, count metric, skip</li>
+ *       <li>Oversized {@code dataJson} → <b>OVERSIZED</b>: log warn, count metric, skip</li>
  *     </ul>
  *   </li>
  *   <li>Items in cache but absent from snapshot → <b>DELETE</b>
@@ -49,16 +49,18 @@ import java.util.Map;
  * This class only <em>reads</em> from Redis. The Lua commit script (BE-06) will
  * apply the resulting {@link WritePlan} atomically, including updating this hash.
  */
-public class ProducerCacheDiffEngine {
+public class ProducerCacheDiffEngine extends AbstractDiffEngine {
 
     private static final Logger log = LoggerFactory.getLogger(ProducerCacheDiffEngine.class);
 
-    private final RedisAPI redis;
-    private final String   prefix;
-
+    /** Convenience constructor for tests — uses the default guardrail limit. */
     public ProducerCacheDiffEngine(RedisAPI redis, String prefix) {
-        this.redis  = redis;
-        this.prefix = prefix;
+        super(redis, prefix);
+    }
+
+    /** Full constructor for production use. */
+    public ProducerCacheDiffEngine(RedisAPI redis, String prefix, int maxDataJsonBytes) {
+        super(redis, prefix, maxDataJsonBytes);
     }
 
     // ---- Public API -------------------------------------------------------------
@@ -69,10 +71,11 @@ public class ProducerCacheDiffEngine {
      * <p>All I/O is non-blocking. The returned {@link Future} completes on the
      * Vert.x event loop — no blocking calls inside.
      */
+    @Override
     public Future<WritePlan> diff(Snapshot snapshot) {
-        String cacheKey = cacheKey(snapshot.topic(), snapshot.producerId());
+        String cacheKey = prodverHashKey(snapshot.topic(), snapshot.producerId());
 
-        return redis.hgetall(cacheKey)
+        return redis().hgetall(cacheKey)
                 .map(response -> computeDiff(snapshot, parseHgetall(response)))
                 .onFailure(err -> log.error(
                         "event=prodver_diff.cache_read_error topic={} producerId={} error=\"{}\"",
@@ -119,6 +122,7 @@ public class ProducerCacheDiffEngine {
 
             if (oldVersion == null) {
                 // New item — not previously seen for this producer
+                if (!checkPayloadSize(newItem, topic, producerId)) continue;
                 log.debug("event=prodver_diff.upsert_new topic={} producerId={} "
                                 + "itemId={} version={}",
                         topic, producerId, newItem.itemId(), newItem.version());
@@ -126,6 +130,7 @@ public class ProducerCacheDiffEngine {
 
             } else if (newItem.version() > oldVersion) {
                 // Higher version — apply the update
+                if (!checkPayloadSize(newItem, topic, producerId)) continue;
                 log.debug("event=prodver_diff.upsert_higher topic={} producerId={} "
                                 + "itemId={} oldVersion={} newVersion={}",
                         topic, producerId, newItem.itemId(), oldVersion, newItem.version());
@@ -144,6 +149,7 @@ public class ProducerCacheDiffEngine {
                         topic, producerId, newItem.itemId(), oldVersion, newItem.version());
                 BrokerMetrics.versionAnomaly(topic);
                 // Policy: skip — do not apply a version regression
+                // TODO : decide if drop or continue if on of the items have lower  version
             }
         }
 
@@ -160,8 +166,8 @@ public class ProducerCacheDiffEngine {
                             + "itemCount={} {}",
                     topic, producerId, snapshot.msgTs(), snapshot.items().size(),
                     plan.summary());
-            plan.upserts().forEach(u -> BrokerMetrics.itemUpsert(topic));
-            plan.deletes().forEach(d -> BrokerMetrics.itemDelete(topic));
+            BrokerMetrics.itemUpsertCount(topic, plan.upserts().size());
+            BrokerMetrics.itemDeleteCount(topic, plan.deletes().size());
         }
 
         return plan;
@@ -170,27 +176,18 @@ public class ProducerCacheDiffEngine {
     // ---- Helpers ----------------------------------------------------------------
 
     /**
-     * Parses a Redis HGETALL {@link Response} into a plain {@code Map<String, Long>}.
-     *
-     * <p>HGETALL returns a flat bulk-string array: [field0, val0, field1, val1, …].
-     * {@code Response.keys()} is NOT available in Vert.x 4.5.x; use index-based
-     * iteration with {@code i += 2}.
+     * Returns {@code true} if the item's {@code dataJson} is within the allowed
+     * limit; logs a warning and emits a metric if it exceeds the limit.
      */
-    static Map<String, Long> parseHgetall(Response response) {
-        Map<String, Long> result = new HashMap<>();
-        if (response == null || response.size() == 0) {
-            return result;
+    private boolean checkPayloadSize(SnapshotItem item, String topic, String producerId) {
+        if (item.dataJson() != null && item.dataJson().length() > maxDataJsonBytes) {
+            log.warn("event=prodver_diff.oversized_payload topic={} producerId={} "
+                            + "itemId={} dataJsonBytes={} max={}",
+                    topic, producerId, item.itemId(),
+                    item.dataJson().length(), maxDataJsonBytes);
+            BrokerMetrics.oversizedPayload(topic);
+            return false;
         }
-        for (int i = 0; i < response.size() - 1; i += 2) {
-            String field   = response.get(i).toString();
-            long   version = Long.parseLong(response.get(i + 1).toString());
-            result.put(field, version);
-        }
-        return result;
-    }
-
-    /** {@code bp:prodver:{topic}:{producerId}} */
-    private String cacheKey(String topic, String producerId) {
-        return prefix + ":prodver:" + topic + ":" + producerId;
+        return true;
     }
 }

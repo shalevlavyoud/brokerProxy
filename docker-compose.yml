@@ -1,0 +1,385 @@
+# =============================================================================
+# Broker Proxy — Local Development Stack
+# Services: Redis (primary + replica + 3 Sentinels), ZooKeeper, ActiveMQ,
+#           Broker Proxy, KOSERVER, Prometheus
+#
+# Usage:
+#   Infrastructure only:  docker compose up redis-primary redis-replica \
+#                           redis-sentinel-1 redis-sentinel-2 redis-sentinel-3 \
+#                           zookeeper activemq prometheus
+#   Full stack:           docker compose up          (requires mvn build first)
+#   With rebuild:         docker compose up --build
+# =============================================================================
+
+services:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # REDIS — Primary
+  # ══════════════════════════════════════════════════════════════════════════
+  redis-primary:
+    image: redis:7.2-alpine
+    container_name: redis-primary
+    command: redis-server /etc/redis/redis.conf
+    volumes:
+      - ./infra/redis/primary/redis.conf:/etc/redis/redis.conf:ro
+      - redis-primary-data:/data
+    ports:
+      - "${REDIS_PRIMARY_PORT:-6379}:6379"
+    networks:
+      - broker-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # REDIS — Replica
+  # ══════════════════════════════════════════════════════════════════════════
+  redis-replica:
+    image: redis:7.2-alpine
+    container_name: redis-replica
+    # --replicaof injected at runtime so the conf file stays generic
+    command: >
+      redis-server /etc/redis/redis.conf
+      --replicaof redis-primary 6379
+    volumes:
+      - ./infra/redis/replica/redis.conf:/etc/redis/redis.conf:ro
+      - redis-replica-data:/data
+    ports:
+      - "${REDIS_REPLICA_PORT:-6380}:6379"
+    networks:
+      - broker-net
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # REDIS SENTINEL — Node 1 (port 26379)
+  # ══════════════════════════════════════════════════════════════════════════
+  redis-sentinel-1:
+    image: redis:7.2-alpine
+    container_name: redis-sentinel-1
+    command:
+      - sh
+      - -c
+      - |
+        until MASTER_IP=$$(getent hosts redis-primary | awk '{print $$1}') && [ -n "$$MASTER_IP" ]; do
+          echo "sentinel-1: waiting for redis-primary IP resolution..."; sleep 1;
+        done &&
+        echo "port 26379" > /tmp/sentinel.conf &&
+        echo "bind 0.0.0.0" >> /tmp/sentinel.conf &&
+        echo "sentinel monitor mymaster $$MASTER_IP 6379 2" >> /tmp/sentinel.conf &&
+        echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
+        echo "sentinel failover-timeout mymaster 30000" >> /tmp/sentinel.conf &&
+        echo "sentinel parallel-syncs mymaster 1" >> /tmp/sentinel.conf &&
+        echo "sentinel announce-port 26379" >> /tmp/sentinel.conf &&
+        redis-sentinel /tmp/sentinel.conf
+    ports:
+      - "${REDIS_SENTINEL_1_PORT:-26379}:26379"
+    networks:
+      - broker-net
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # REDIS SENTINEL — Node 2 (port 26380)
+  # ══════════════════════════════════════════════════════════════════════════
+  redis-sentinel-2:
+    image: redis:7.2-alpine
+    container_name: redis-sentinel-2
+    command:
+      - sh
+      - -c
+      - |
+        until MASTER_IP=$$(getent hosts redis-primary | awk '{print $$1}') && [ -n "$$MASTER_IP" ]; do
+          echo "sentinel-2: waiting for redis-primary IP resolution..."; sleep 1;
+        done &&
+        echo "port 26379" > /tmp/sentinel.conf &&
+        echo "bind 0.0.0.0" >> /tmp/sentinel.conf &&
+        echo "sentinel monitor mymaster $$MASTER_IP 6379 2" >> /tmp/sentinel.conf &&
+        echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
+        echo "sentinel failover-timeout mymaster 30000" >> /tmp/sentinel.conf &&
+        echo "sentinel parallel-syncs mymaster 1" >> /tmp/sentinel.conf &&
+        echo "sentinel announce-port 26379" >> /tmp/sentinel.conf &&
+        redis-sentinel /tmp/sentinel.conf
+    ports:
+      - "${REDIS_SENTINEL_2_PORT:-26380}:26379"
+    networks:
+      - broker-net
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # REDIS SENTINEL — Node 3 (port 26381)
+  # ══════════════════════════════════════════════════════════════════════════
+  redis-sentinel-3:
+    image: redis:7.2-alpine
+    container_name: redis-sentinel-3
+    command:
+      - sh
+      - -c
+      - |
+        until MASTER_IP=$$(getent hosts redis-primary | awk '{print $$1}') && [ -n "$$MASTER_IP" ]; do
+          echo "sentinel-3: waiting for redis-primary IP resolution..."; sleep 1;
+        done &&
+        echo "port 26379" > /tmp/sentinel.conf &&
+        echo "bind 0.0.0.0" >> /tmp/sentinel.conf &&
+        echo "sentinel monitor mymaster $$MASTER_IP 6379 2" >> /tmp/sentinel.conf &&
+        echo "sentinel down-after-milliseconds mymaster 5000" >> /tmp/sentinel.conf &&
+        echo "sentinel failover-timeout mymaster 30000" >> /tmp/sentinel.conf &&
+        echo "sentinel parallel-syncs mymaster 1" >> /tmp/sentinel.conf &&
+        echo "sentinel announce-port 26379" >> /tmp/sentinel.conf &&
+        redis-sentinel /tmp/sentinel.conf
+    ports:
+      - "${REDIS_SENTINEL_3_PORT:-26381}:26379"
+    networks:
+      - broker-net
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # ZOOKEEPER (leader election)
+  # ══════════════════════════════════════════════════════════════════════════
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: "ruok,srvr,mntr,stat"
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr,mntr,stat"
+    ports:
+      - "${ZK_PORT:-2181}:2181"
+    networks:
+      - broker-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep -q 'Zookeeper version'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # ACTIVEMQ (message broker)
+  # Topics: computers, headsets, conferences
+  # Web console: http://localhost:8161  (admin / admin)
+  # ══════════════════════════════════════════════════════════════════════════
+  activemq:
+    image: apache/activemq-classic:5.18.4
+    container_name: activemq
+    ports:
+      - "${ACTIVEMQ_OPENWIRE_PORT:-61616}:61616"  # OpenWire / JMS
+      - "${ACTIVEMQ_CONSOLE_PORT:-8161}:8161"     # Web console
+      - "5672:5672"                                # AMQP
+      - "61613:61613"                              # STOMP
+    volumes:
+      - ./infra/activemq/activemq.xml:/opt/apache-activemq/conf/activemq.xml:ro
+      - activemq-data:/opt/apache-activemq/data
+    networks:
+      - broker-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u admin:admin http://localhost:8161/admin >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # BROKER PROXY (application — requires backend code)
+  # Build context: repo root (Maven multi-module)
+  # ══════════════════════════════════════════════════════════════════════════
+  broker-proxy:
+    build:
+      context: .
+      dockerfile: docker/broker-proxy/Dockerfile
+    container_name: broker-proxy
+    image: broker-proxy:local
+    env_file: .env
+    environment:
+      # Override any .env values specific to docker networking
+      ACTIVEMQ_URL: "tcp://activemq:${ACTIVEMQ_OPENWIRE_PORT:-61616}"
+      REDIS_SENTINEL_HOSTS: "redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379"
+      REDIS_MASTER_NAME: "${REDIS_MASTER_NAME:-mymaster}"
+      ZK_CONNECT: "zookeeper:${ZK_PORT:-2181}"
+      INSTANCE_ID: "broker-proxy-1"
+    ports:
+      - "${BP_PORT:-8080}:8080"
+    networks:
+      - broker-net
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
+      zookeeper:
+        condition: service_healthy
+      activemq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # KOSERVER (pull API — requires backend code)
+  # GET /changes?topic={t}&sinceSeq={n}&limit={k}
+  # ══════════════════════════════════════════════════════════════════════════
+  koserver:
+    build:
+      context: .
+      dockerfile: docker/koserver/Dockerfile
+    container_name: koserver
+    image: koserver:local
+    env_file: .env
+    environment:
+      REDIS_SENTINEL_HOSTS: "redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379"
+      REDIS_MASTER_NAME: "${REDIS_MASTER_NAME:-mymaster}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-bp:}"
+      KOSERVER_PORT: "${KOSERVER_PORT:-8081}"
+    ports:
+      - "${KOSERVER_PORT:-8081}:8081"
+    networks:
+      - broker-net
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # PROMETHEUS (observability)
+  # UI: http://localhost:9090
+  # ══════════════════════════════════════════════════════════════════════════
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts:/etc/prometheus/alerts:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - broker-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NETWORKS
+# ══════════════════════════════════════════════════════════════════════════════
+networks:
+  broker-net:
+    driver: bridge
+    name: broker-net
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLUMES
+# ══════════════════════════════════════════════════════════════════════════════
+volumes:
+  redis-primary-data:
+    name: broker-proxy-redis-primary
+  redis-replica-data:
+    name: broker-proxy-redis-replica
+  activemq-data:
+    name: broker-proxy-activemq
+  prometheus-data:
+    name: broker-proxy-prometheus

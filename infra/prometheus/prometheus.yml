@@ -1,0 +1,61 @@
+# =============================================================================
+# Prometheus Scrape Configuration
+# Broker Proxy + KOSERVER observability
+# =============================================================================
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  scrape_timeout:      10s
+
+  external_labels:
+    environment: 'local'
+    project:     'broker-proxy'
+
+# ── Alert rules ──────────────────────────────────────────────────────────────
+rule_files:
+  - "alerts/*.yml"
+
+# ── Alertmanager (optional — wire up when available) ─────────────────────────
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+# ── Scrape configs ────────────────────────────────────────────────────────────
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Broker Proxy — exposes /metrics (Micrometer Prometheus format)
+  - job_name: 'broker-proxy'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['broker-proxy:8080']
+        labels:
+          service: 'broker-proxy'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # KOSERVER — exposes /metrics (Micrometer Prometheus format)
+  - job_name: 'koserver'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['koserver:8081']
+        labels:
+          service: 'koserver'
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+
+  # Redis Exporter (OPS-07 — wire up when deployed)
+  # - job_name: 'redis-exporter'
+  #   metrics_path: '/metrics'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
+  #       labels:
+  #         service: 'redis'

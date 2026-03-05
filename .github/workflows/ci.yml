@@ -1,0 +1,262 @@
+# =============================================================================
+# CI Pipeline — Broker Proxy + KOSERVER
+#
+# Jobs (run in order):
+#   1. build-and-unit-test   — compile + surefire unit tests
+#   2. integration-test      — failsafe integration tests via Testcontainers
+#   3. docker-build-push     — build + push images to GHCR (main branch only)
+#
+# Branch protection: require all three jobs to pass before merging.
+# See docs/ci-setup.md for branch protection configuration steps.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "feature/**"
+      - "fix/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+
+# Cancel in-progress runs on the same branch when a new push arrives
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION:      "21"
+  JAVA_DISTRIBUTION: "temurin"
+  REGISTRY:          "ghcr.io"
+  # Image names: ghcr.io/<owner>/broker-proxy and ghcr.io/<owner>/koserver
+  IMAGE_OWNER:       ${{ github.repository_owner }}
+
+# =============================================================================
+jobs:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Build + Unit Tests
+  # ──────────────────────────────────────────────────────────────────────────
+  build-and-unit-test:
+    name: "Build & Unit Tests"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history for versioning / SonarQube (if added later)
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }} (${{ env.JAVA_DISTRIBUTION }})
+        uses: actions/setup-java@v4
+        with:
+          java-version:  ${{ env.JAVA_VERSION }}
+          distribution:  ${{ env.JAVA_DISTRIBUTION }}
+          cache:         maven    # Caches ~/.m2/repository automatically
+
+      - name: Make Maven wrapper executable
+        run: chmod +x mvnw
+
+      # ── Build all modules + run Surefire unit tests only (skip ITs) ─────────
+      - name: Build and unit test
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            --fail-at-end \
+            verify \
+            -DskipITs \
+            -Dskip.failsafe=true
+        env:
+          MAVEN_OPTS: "-Xmx1g"
+
+      # ── Upload Surefire HTML + XML reports ───────────────────────────────────
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports-${{ github.run_number }}
+          retention-days: 14
+          path: |
+            broker-proxy/target/surefire-reports/
+            koserver/target/surefire-reports/
+
+      # ── Cache compiled classes so integration job re-uses them ───────────────
+      - name: Cache compiled target directories
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            broker-proxy/target/classes
+            broker-proxy/target/test-classes
+            koserver/target/classes
+            koserver/target/test-classes
+          key: compiled-${{ github.sha }}
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Integration Tests (Testcontainers)
+  # Requires Docker daemon (ubuntu-latest runners have it pre-installed)
+  # ──────────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: "Integration Tests (Testcontainers)"
+    runs-on: ubuntu-latest
+    needs: build-and-unit-test
+
+    # Give Testcontainers enough time to pull images + run
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }} (${{ env.JAVA_DISTRIBUTION }})
+        uses: actions/setup-java@v4
+        with:
+          java-version:  ${{ env.JAVA_VERSION }}
+          distribution:  ${{ env.JAVA_DISTRIBUTION }}
+          cache:         maven
+
+      - name: Make Maven wrapper executable
+        run: chmod +x mvnw
+
+      # ── Verify Docker daemon is available for Testcontainers ────────────────
+      - name: Check Docker availability
+        run: docker info
+
+      # ── Pre-pull Testcontainers images to speed up test runtime ─────────────
+      - name: Pre-pull container images
+        run: |
+          docker pull redis:7.2-alpine &
+          docker pull confluentinc/cp-zookeeper:7.6.1 &
+          docker pull apache/activemq-classic:5.18.4 &
+          wait
+          echo "All images pre-pulled."
+
+      # ── Run integration tests via maven-failsafe-plugin ─────────────────────
+      - name: Run integration tests
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            --fail-at-end \
+            verify \
+            -Pintegration-tests \
+            -DskipUnitTests=true
+        env:
+          MAVEN_OPTS: "-Xmx1g"
+          # Testcontainers settings
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+          TESTCONTAINERS_CHECKS_DISABLE: "true"
+          # Reuse containers across tests for speed (CI typically has clean env)
+          TESTCONTAINERS_REUSE_ENABLE: "false"
+
+      # ── Upload Failsafe HTML + XML reports ───────────────────────────────────
+      - name: Upload integration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports-${{ github.run_number }}
+          retention-days: 14
+          path: |
+            broker-proxy/target/failsafe-reports/
+            koserver/target/failsafe-reports/
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Docker Build + Push (GHCR)
+  # Runs only on push to main (not on PRs — avoids publishing unreviewed code)
+  # Images tagged with: sha-<SHORT_SHA>  and  latest
+  # ──────────────────────────────────────────────────────────────────────────
+  docker-build-push:
+    name: "Docker Build & Push"
+    runs-on: ubuntu-latest
+    needs: [build-and-unit-test, integration-test]
+
+    # Only publish on pushes to main; skip for PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write   # Required to push to GHCR
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host   # Allows Buildx to resolve broker-net if needed
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── broker-proxy image ───────────────────────────────────────────────────
+      - name: Extract metadata — broker-proxy
+        id: meta-bp
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/broker-proxy
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=broker-proxy
+            org.opencontainers.image.description=Broker Proxy — ActiveMQ snapshot consumer + Redis state writer
+            org.opencontainers.image.vendor=platform-team
+
+      - name: Build and push broker-proxy
+        uses: docker/build-push-action@v5
+        with:
+          context:    .
+          file:       docker/broker-proxy/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-bp.outputs.tags }}
+          labels:     ${{ steps.meta-bp.outputs.labels }}
+          cache-from: type=gha,scope=broker-proxy
+          cache-to:   type=gha,mode=max,scope=broker-proxy
+          provenance: false   # Keeps image index simple; enable for SBOM later
+
+      # ── koserver image ───────────────────────────────────────────────────────
+      - name: Extract metadata — koserver
+        id: meta-ko
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/koserver
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=koserver
+            org.opencontainers.image.description=KOSERVER — Pull API for Redis change index
+            org.opencontainers.image.vendor=platform-team
+
+      - name: Build and push koserver
+        uses: docker/build-push-action@v5
+        with:
+          context:    .
+          file:       docker/koserver/Dockerfile
+          push:       true
+          tags:       ${{ steps.meta-ko.outputs.tags }}
+          labels:     ${{ steps.meta-ko.outputs.labels }}
+          cache-from: type=gha,scope=koserver
+          cache-to:   type=gha,mode=max,scope=koserver
+          provenance: false
+
+      # ── Print published image digests ────────────────────────────────────────
+      - name: Summary
+        run: |
+          echo "### Published Images" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Tags |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| broker-proxy | \`${{ steps.meta-bp.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| koserver     | \`${{ steps.meta-ko.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY

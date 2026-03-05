@@ -4,7 +4,7 @@
     "host": "0.0.0.0"
   },
   "redis": {
-    "host": "localhost",
+    "host": "127.0.0.1",
     "port": 6379,
     "prefix": "bp",
     "connectTimeout": 5000,
@@ -12,7 +12,7 @@
   },
   "topics": ["computers", "headsets", "conferences"],
   "activemq": {
-    "brokerUrl": "tcp://localhost:61616"
+    "brokerUrl": "tcp://127.0.0.1:61616"
   },
   "jms": {
     "topicPrefetch": 10,

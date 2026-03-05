@@ -9,6 +9,8 @@ import io.vertx.core.Vertx;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.TimeoutException;
+
 /**
  * Production-safe wrapper around {@link LuaCommitScript} that adds:
  * <ul>
@@ -36,8 +38,12 @@ public class CommitExecutor {
     private final long             leaderEpoch;
     private final int              maxRetries;
     private final int              retryDelayMs;
+    /** Per-attempt timeout in ms; 0 means no timeout applied. */
+    private final int              commitTimeoutMs;
 
     /**
+     * Backward-compatible constructor — no per-attempt timeout.
+     *
      * @param vertx         Vert.x instance (needed for retry timer)
      * @param script        the underlying Lua commit script handle
      * @param leaderEpoch   epoch passed to the Lua script for fencing
@@ -46,11 +52,23 @@ public class CommitExecutor {
      */
     public CommitExecutor(Vertx vertx, LuaCommitScript script, long leaderEpoch,
                           int maxRetries, int retryDelayMs) {
-        this.vertx        = vertx;
-        this.script       = script;
-        this.leaderEpoch  = leaderEpoch;
-        this.maxRetries   = maxRetries;
-        this.retryDelayMs = retryDelayMs;
+        this(vertx, script, leaderEpoch, maxRetries, retryDelayMs, 0);
+    }
+
+    /**
+     * Full constructor for production use.
+     *
+     * @param commitTimeoutMs per-attempt Redis timeout in ms; {@code 0} disables the
+     *                        timeout (each attempt may wait indefinitely for Redis)
+     */
+    public CommitExecutor(Vertx vertx, LuaCommitScript script, long leaderEpoch,
+                          int maxRetries, int retryDelayMs, int commitTimeoutMs) {
+        this.vertx           = vertx;
+        this.script          = script;
+        this.leaderEpoch     = leaderEpoch;
+        this.maxRetries      = maxRetries;
+        this.retryDelayMs    = retryDelayMs;
+        this.commitTimeoutMs = commitTimeoutMs;
     }
 
     // ---- Public API -------------------------------------------------------------
@@ -93,7 +111,7 @@ public class CommitExecutor {
      * @param remaining number of retry attempts left (0 = propagate failure)
      */
     private Future<CommitResult> executeWithRetry(WritePlan plan, int remaining) {
-        return script.eval(plan, leaderEpoch)
+        return withTimeout(script.eval(plan, leaderEpoch), plan)
                 .recover(err -> {
                     if (remaining > 0) {
                         log.warn("event=commit_executor.retry topic={} producerId={} "
@@ -117,6 +135,39 @@ public class CommitExecutor {
         Promise<CommitResult> promise = Promise.promise();
         vertx.setTimer(retryDelayMs, ignored ->
                 executeWithRetry(plan, remaining).onComplete(promise));
+        return promise.future();
+    }
+
+    /**
+     * Wraps a commit {@link Future} with a configurable per-attempt timeout.
+     *
+     * <p>When {@code commitTimeoutMs <= 0}, returns {@code f} unchanged.
+     * Otherwise, a Vert.x timer is armed; if the timer fires before the future
+     * completes, the promise is failed with a {@link TimeoutException} and the
+     * timer is cancelled on success/failure to avoid resource leaks.
+     *
+     * <p>Both the timer callback and the future callback run on the same
+     * event-loop thread, so no synchronisation is required — only one branch
+     * will ever win the {@code !promise.future().isComplete()} guard.
+     */
+    private Future<CommitResult> withTimeout(Future<CommitResult> f, WritePlan plan) {
+        if (commitTimeoutMs <= 0) return f;
+
+        Promise<CommitResult> promise = Promise.promise();
+        long timerId = vertx.setTimer(commitTimeoutMs, id -> {
+            if (!promise.future().isComplete()) {
+                log.warn("event=commit_executor.timeout topic={} producerId={} commitTimeoutMs={}",
+                        plan.topic(), plan.producerId(), commitTimeoutMs);
+                promise.fail(new TimeoutException(
+                        "Redis commit timed out after " + commitTimeoutMs + "ms"));
+            }
+        });
+        f.onComplete(ar -> {
+            vertx.cancelTimer(timerId);
+            if (!promise.future().isComplete()) {
+                promise.handle(ar);
+            }
+        });
         return promise.future();
     }
 }

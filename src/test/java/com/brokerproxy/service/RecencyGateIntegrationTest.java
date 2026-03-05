@@ -30,6 +30,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>Tests the key invariant: only snapshots with {@code msgTs > lastAccepted}
  * pass the gate, including the canonical sequence {@code 10 → 9 → 10} where
  * only the first snapshot is accepted.
+ *
+ * <p>Note: recency advancement is now performed exclusively inside the atomic
+ * Lua commit script (BE-06).  These tests simulate that by writing directly to
+ * Redis via the API — {@link RecencyGate} itself is read-only.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class RecencyGateIntegrationTest {
@@ -141,8 +145,8 @@ class RecencyGateIntegrationTest {
         RecencyResult r1 = await(gate.check(snap(topic, producerId, 10L)));
         assertThat(r1.wasAccepted()).as("msgTs=10 (first) should be accepted").isTrue();
 
-        // Simulate what BE-06 Lua will do atomically: advance recency to 10
-        await(gate.updateRecency(snap(topic, producerId, 10L)));
+        // Simulate what the Lua commit script does atomically: advance recency to 10
+        await(api.set(List.of("bp:recency:computers:prod-seq", "10")));
 
         // 2. msgTs=9 — 9 <= 10 → DROPPED
         RecencyResult r2 = await(gate.check(snap(topic, producerId, 9L)));
@@ -153,31 +157,6 @@ class RecencyGateIntegrationTest {
         RecencyResult r3 = await(gate.check(snap(topic, producerId, 10L)));
         assertThat(r3.wasAccepted()).as("msgTs=10 (duplicate) should be dropped").isFalse();
         assertThat(r3.lastAcceptedTs()).isEqualTo(10L);
-    }
-
-    // ---- updateRecency tests ----------------------------------------------------
-
-    @Test
-    @DisplayName("updateRecency writes the correct key and value to Redis")
-    void updateRecency_writes_correct_key() throws Exception {
-        Snapshot s = snap("headsets", "prod-u", 999L);
-
-        await(gate.updateRecency(s));
-
-        var stored = await(api.get("bp:recency:headsets:prod-u"));
-        assertThat(stored).isNotNull();
-        assertThat(Long.parseLong(stored.toString())).isEqualTo(999L);
-    }
-
-    @Test
-    @DisplayName("updateRecency overwrites an older recency value")
-    void updateRecency_overwrites_older_value() throws Exception {
-        seedRecency("conferences", "prod-v", 50L);
-
-        await(gate.updateRecency(snap("conferences", "prod-v", 75L)));
-
-        var stored = await(api.get("bp:recency:conferences:prod-v"));
-        assertThat(Long.parseLong(stored.toString())).isEqualTo(75L);
     }
 
     // ---- Helpers ----------------------------------------------------------------

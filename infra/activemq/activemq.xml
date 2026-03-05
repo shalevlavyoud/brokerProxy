@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  =============================================================================
+  ActiveMQ Classic Configuration
+  Broker Proxy — Topics: computers, headsets, conferences
+  =============================================================================
+-->
+<beans
+  xmlns="http://www.springframework.org/schema/beans"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.springframework.org/schema/beans
+    http://www.springframework.org/schema/beans/spring-beans.xsd
+    http://activemq.apache.org/schema/core
+    http://activemq.apache.org/schema/core/activemq-core.xsd">
+
+  <!-- Allows us to use system properties as variables in this configuration file -->
+  <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+    <property name="locations">
+      <value>file:${activemq.conf}/credentials.properties</value>
+    </property>
+  </bean>
+
+  <broker xmlns="http://activemq.apache.org/schema/core"
+          brokerName="broker-proxy-amq"
+          dataDirectory="${activemq.data}"
+          useJmx="true"
+          schedulerSupport="false">
+
+    <!-- ── Destinations ──────────────────────────────────────────────────── -->
+    <destinations>
+      <topic physicalName="computers"/>
+      <topic physicalName="headsets"/>
+      <topic physicalName="conferences"/>
+    </destinations>
+
+    <!-- ── Destination Policies ──────────────────────────────────────────── -->
+    <destinationPolicy>
+      <policyMap>
+        <policyEntries>
+          <!-- Default policy for all topics -->
+          <policyEntry topic=">" producerFlowControl="true" memoryLimit="64mb">
+            <!-- Dispatch policy: round-robin for consumer groups -->
+            <dispatchPolicy>
+              <roundRobinDispatchPolicy/>
+            </dispatchPolicy>
+            <!-- Dead letter strategy for undeliverable messages -->
+            <deadLetterStrategy>
+              <individualDeadLetterStrategy topicPrefix="DLQ." useQueueForTopicMessages="false"/>
+            </deadLetterStrategy>
+          </policyEntry>
+
+          <!-- computers: Single-item snapshots; tighter memory limit -->
+          <policyEntry topic="computers" producerFlowControl="true" memoryLimit="32mb"/>
+
+          <!-- headsets: Up to 80 items per snapshot -->
+          <policyEntry topic="headsets" producerFlowControl="true" memoryLimit="64mb"/>
+
+          <!-- conferences: Up to 500 items per snapshot — larger memory budget -->
+          <policyEntry topic="conferences" producerFlowControl="true" memoryLimit="128mb"/>
+        </policyEntries>
+      </policyMap>
+    </destinationPolicy>
+
+    <!-- ── System Usage / Memory ─────────────────────────────────────────── -->
+    <systemUsage>
+      <systemUsage>
+        <memoryUsage>
+          <memoryUsage percentOfJvmHeap="70"/>
+        </memoryUsage>
+        <storeUsage>
+          <storeUsage limit="5 gb"/>
+        </storeUsage>
+        <tempUsage>
+          <tempUsage limit="3 gb"/>
+        </tempUsage>
+      </systemUsage>
+    </systemUsage>
+
+    <!-- ── Transport Connectors ───────────────────────────────────────────── -->
+    <transportConnectors>
+      <!-- OpenWire (primary JMS protocol used by Broker Proxy) -->
+      <transportConnector name="openwire"
+        uri="tcp://0.0.0.0:61616?maximumConnections=500&amp;wireFormat.maxFrameSize=104857600"/>
+
+      <!-- AMQP (optional — for future integrations) -->
+      <transportConnector name="amqp"
+        uri="amqp://0.0.0.0:5672?maximumConnections=100&amp;wireFormat.maxFrameSize=104857600"/>
+
+      <!-- STOMP (optional — for debugging / tooling) -->
+      <transportConnector name="stomp"
+        uri="stomp://0.0.0.0:61613?maximumConnections=100&amp;wireFormat.maxFrameSize=104857600"/>
+    </transportConnectors>
+
+    <!-- ── Management Context (JMX) ──────────────────────────────────────── -->
+    <managementContext>
+      <managementContext createConnector="false"/>
+    </managementContext>
+
+    <!-- ── Persistence Adapter ───────────────────────────────────────────── -->
+    <persistenceAdapter>
+      <kahaDB directory="${activemq.data}/kahadb"
+              journalMaxFileLength="32mb"
+              enableJournalDiskSyncs="true"/>
+    </persistenceAdapter>
+
+    <!-- ── Shutdown hooks ────────────────────────────────────────────────── -->
+    <shutdownHooks>
+      <bean xmlns="http://www.springframework.org/schema/beans"
+            class="org.apache.activemq.hooks.SpringContextHook"/>
+    </shutdownHooks>
+
+  </broker>
+
+  <!-- ── Web Console ───────────────────────────────────────────────────────── -->
+  <import resource="jetty.xml"/>
+
+</beans>

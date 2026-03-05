@@ -1,0 +1,166 @@
+# =============================================================================
+# Prometheus Alert Rules — Broker Proxy + KOSERVER
+# =============================================================================
+groups:
+
+  # ── Broker Proxy Alerts ──────────────────────────────────────────────────
+  - name: broker_proxy
+    rules:
+
+      # Alert: Redis commit p99 latency too high
+      - alert: BrokerProxyCommitLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(brokerproxy_redis_commit_duration_seconds_bucket[5m])
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: broker-proxy
+        annotations:
+          summary: "Broker Proxy commit p99 latency > 50ms"
+          description: |
+            Redis commit p99 latency is {{ $value | humanizeDuration }} for topic {{ $labels.topic }}.
+            This may indicate Lua script slowness, Redis CPU saturation, or large payloads.
+          runbook: "Check Redis slowlog; verify no HGETALL on state hashes; check payload sizes."
+
+      # Alert: Snapshot drop ratio spike
+      - alert: BrokerProxyHighDropRatio
+        expr: |
+          (
+            rate(brokerproxy_snapshots_dropped_total[5m])
+            /
+            rate(brokerproxy_snapshots_received_total[5m])
+          ) > 0.01
+        for: 2m
+        labels:
+          severity: warning
+          service: broker-proxy
+        annotations:
+          summary: "Broker Proxy drop ratio > 1% for topic {{ $labels.topic }}"
+          description: |
+            Drop ratio is {{ $value | humanizePercentage }} for topic {{ $labels.topic }}, reason={{ $labels.reason }}.
+            High out-of-order/duplicate rate may indicate clock skew at producers.
+          runbook: "Check producer clock synchronisation; verify msgTs monotonicity."
+
+      # Alert: Version anomalies detected
+      - alert: BrokerProxyVersionAnomalyDetected
+        expr: increase(brokerproxy_version_anomaly_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: broker-proxy
+        annotations:
+          summary: "Version anomaly detected in topic {{ $labels.topic }}"
+          description: |
+            A version rollback was detected: newVersion < storedVersion.
+            This violates the version monotonicity contract and the item update was dropped.
+          runbook: "Investigate the producer publishing the snapshot; check for state reset."
+
+      # Alert: Leadership flapping
+      - alert: BrokerProxyLeadershipFlapping
+        expr: increase(brokerproxy_leadership_changes_total[10m]) > 3
+        for: 0m
+        labels:
+          severity: critical
+          service: broker-proxy
+        annotations:
+          summary: "Broker Proxy leadership is flapping (>3 changes in 10m)"
+          description: |
+            {{ $value }} leadership transitions in the last 10 minutes.
+            This causes write outages and may indicate ZooKeeper connectivity issues.
+          runbook: "Check ZooKeeper connectivity from all broker-proxy instances; check network partitions."
+
+      # Alert: Epoch fencing denials
+      - alert: BrokerProxyFencingDenials
+        expr: increase(brokerproxy_fencing_denied_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          service: broker-proxy
+        annotations:
+          summary: "Stale leader fencing denials detected"
+          description: |
+            A stale Broker Proxy instance attempted to commit to Redis but was blocked by epoch fencing.
+            This is expected during leader transitions but persistent denials indicate a stuck instance.
+          runbook: "Identify the fenced instance (check logs for FENCED errors) and restart it."
+
+  # ── KOSERVER Alerts ──────────────────────────────────────────────────────
+  - name: koserver
+    rules:
+
+      # Alert: Full resync required spike
+      - alert: KOServerResyncRequiredSpike
+        expr: increase(koserver_pull_resync_required_total[10m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+          service: koserver
+        annotations:
+          summary: "KOSERVER resync spike for topic {{ $labels.topic }}"
+          description: |
+            {{ $value }} full-resync responses in the last 10 minutes for topic {{ $labels.topic }}.
+            This means sinceSeq is behind the retention watermark — consumers are too slow or retention window is too small.
+          runbook: "Increase RETENTION_WINDOW_SEQS or speed up downstream consumer processing."
+
+      # Alert: KOSERVER Redis read latency high
+      - alert: KOServerReadLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(koserver_redis_read_duration_seconds_bucket[5m])
+          ) > 0.03
+        for: 5m
+        labels:
+          severity: warning
+          service: koserver
+        annotations:
+          summary: "KOSERVER Redis read p99 latency > 30ms"
+          description: |
+            KOSERVER Redis read p99 is {{ $value | humanizeDuration }} for topic {{ $labels.topic }}.
+          runbook: "Check Redis primary load; verify HMGET pipeline is used (not individual GETs)."
+
+  # ── Redis Alerts (pre-wired for OPS-07 Redis exporter) ──────────────────
+  - name: redis
+    rules:
+
+      # Alert: Redis memory usage > 85%
+      - alert: RedisMemoryUsageHigh
+        expr: |
+          (redis_used_memory_bytes / redis_maxmemory_bytes) > 0.85
+        for: 10m
+        labels:
+          severity: critical
+          service: redis
+        annotations:
+          summary: "Redis memory usage > 85%"
+          description: |
+            Redis memory is at {{ $value | humanizePercentage }}.
+            With noeviction policy, writes WILL start failing if this reaches 100%.
+          runbook: "Reduce retention window; check for payload size growth; scale Redis memory."
+
+      # Alert: Redis evictions (MUST be zero)
+      - alert: RedisEvictionsNonZero
+        expr: increase(redis_evicted_keys_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: redis
+        annotations:
+          summary: "Redis is evicting keys — DATA LOSS POSSIBLE"
+          description: |
+            Redis evicted {{ $value }} keys. With noeviction policy this should NEVER happen.
+            If this alert fires, the Redis instance may be misconfigured.
+          runbook: "Immediately check maxmemory-policy; restart Redis if policy is wrong."
+
+      # Alert: Redis replication link down
+      - alert: RedisReplicationLinkDown
+        expr: redis_connected_slaves < 1
+        for: 30s
+        labels:
+          severity: critical
+          service: redis
+        annotations:
+          summary: "Redis primary has no connected replicas"
+          description: |
+            With min-replicas-to-write=1, writes will be BLOCKED until a replica reconnects.
+          runbook: "Check Redis replica container status; check network between primary and replica."

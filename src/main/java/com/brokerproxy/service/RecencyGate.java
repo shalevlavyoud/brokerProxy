@@ -7,8 +7,6 @@ import io.vertx.redis.client.RedisAPI;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
-
 /**
  * Enforces the per-{@code (topic, producerId)} recency invariant:
  * only snapshots with a strictly increasing {@code msgTs} are accepted.
@@ -21,12 +19,8 @@ import java.util.List;
  * producer and are small (a few bytes each).
  *
  * <h3>Atomicity note</h3>
- * {@link #updateRecency} performs a non-atomic {@code SET}.  This is intentional
- * for BE-03: the Lua commit script (BE-06) will subsume this write so that recency
- * is updated atomically with state and change-index updates.
- * <p>
- * <strong>TODO BE-06:</strong> remove {@link #updateRecency} from the Java call-site
- * in {@code SnapshotProcessorVerticle} once it is part of the Lua script.
+ * Recency is advanced atomically inside the Lua commit script (BE-06) together
+ * with all state and change-index writes.  This class is read-only at runtime.
  */
 public class RecencyGate {
 
@@ -66,19 +60,6 @@ public class RecencyGate {
                 })
                 .onFailure(err -> log.error(
                         "event=recency.check_error key={} error=\"{}\"", key, err.getMessage()));
-    }
-
-    /**
-     * Writes {@code SET bp:recency:{topic}:{producerId} {msgTs}}.
-     *
-     * <p><strong>TEMPORARY — BE-03 only.</strong>  In BE-06 this write will be
-     * removed from Java and performed inside the atomic Lua commit script so that
-     * recency is never advanced unless the full state+index commit succeeds.
-     */
-    public Future<Void> updateRecency(Snapshot snapshot) {
-        String key = recencyKey(snapshot.topic(), snapshot.producerId());
-        return redis.set(List.of(key, String.valueOf(snapshot.msgTs())))
-                .mapEmpty();
     }
 
     // ---- Helpers ----------------------------------------------------------------
